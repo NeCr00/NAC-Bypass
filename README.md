@@ -73,4 +73,11 @@ chmod +x nac_bypass_setup.sh awareness.sh
 | `-g <MAC>` | Manually specify gateway MAC address |
 | `-R` | Enable Responder port redirection |
 | `-S` | Enable OpenSSH port redirection and start the service |
-| `-r` | Reset all settings |
+
+## Resetting Configuration
+In case of any issue which sets the trasparent bridge to unstable state, try to reset the configuration and try again
+
+```bash
+./nac_bypass_setup.sh -r
+```
+
