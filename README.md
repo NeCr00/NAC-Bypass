@@ -38,7 +38,7 @@ This toolkit provides a robust method to bypass **Network Access Control (NAC)**
 - Linux with `brctl`, `arptables`, `ebtables`, `iptables`, `tcpdump`, `macchanger`
 - Root privileges
 - Two physical NICs (eth0, eth1)
-- Internet-disabled NAC environment (ideal)
+
 
 
 ## Usage
