@@ -7,7 +7,7 @@ This toolkit provides a robust method to bypass **Network Access Control (NAC)**
 - `nac_bypass_setup.sh`: Creates a transparent bridge, learns MAC/IP information, and configures ARP, ebtables, and iptables to impersonate the victim.
 - `awareness.sh`: Monitors the physical link state of an interface and automatically resets or re-establishes the bridge when devices connect/disconnect.
 
----
+
 
 ## What Does It Do?
 
@@ -17,7 +17,6 @@ This toolkit provides a robust method to bypass **Network Access Control (NAC)**
 - Automatically **handles reconnections** if the link state changes.
 - Supports **autonomous mode** for full automation and stealth.
 
----
 
 ## Deployment Architecture
 
@@ -30,7 +29,7 @@ This toolkit provides a robust method to bypass **Network Access Control (NAC)**
 - `br0`: Software bridge used to transparently pass traffic.
 - The attacker can forward packets as if they are the victim.
 
----
+
 
 ## Setup
 
@@ -41,7 +40,6 @@ This toolkit provides a robust method to bypass **Network Access Control (NAC)**
 - Two physical NICs (eth0, eth1)
 - Internet-disabled NAC environment (ideal)
 
----
 
 ## Usage
 
