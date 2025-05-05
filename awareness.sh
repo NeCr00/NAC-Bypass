@@ -15,7 +15,7 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 COMMON_OPTS=()                 # options forwarded to nac_bypass_setup.sh
 
 ############### 2. purge previous logs ########################################
-rm -f "$(pwd)"/nac_bypass_setup_*.log 2>/dev/null || true
+rm -f "$(pwd)"/nac_bypass_setup.log 2>/dev/null || true
 
 ############### 3. usage / arg-parsing ########################################
 Usage() {
@@ -59,7 +59,7 @@ call_setup() {
   case "$1" in
     init)  bash "$SCRIPT_DIR/nac_bypass_setup.sh" -a -i "${COMMON_OPTS[@]}" ;;
     conn)  bash "$SCRIPT_DIR/nac_bypass_setup.sh" -a -c "${COMMON_OPTS[@]}" ;;
-    reset) bash "$SCRIPT_DIR/nac_bypass_setup.sh" -a -r ;;
+    reset) bash "$SCRIPT_DIR/nac_bypass_setup.sh" -a -r;;
   esac
 }
 
