@@ -119,7 +119,7 @@ Learn(){
     else
     log "SYN file is empty."
     log "Cannot learn MAC and IP of the victim machine. Resetting and trying again."
-    ifconfig $COMPINT down
+    ifconfig $SWINT down
     Reset;
     exit 1
     fi
