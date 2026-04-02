@@ -161,7 +161,14 @@ InitialSetup() {
     # ──── Kill noisy services and harden host networking ────
     systemctl stop NetworkManager.service                      # avoid auto-DHCP
     cp /etc/sysctl.conf /etc/sysctl.conf.bak                   # backup
-    echo "net.ipv6.conf.all.disable_ipv6 = 1" > /etc/sysctl.conf
+
+    # Load br_netfilter so iptables conntrack can process bridged return traffic
+    modprobe br_netfilter
+
+    cat > /etc/sysctl.conf <<EOF
+net.ipv6.conf.all.disable_ipv6 = 1
+net.bridge.bridge-nf-call-iptables = 1
+EOF
     sysctl -p                                                  # reload
     echo "" > /etc/resolv.conf
 
