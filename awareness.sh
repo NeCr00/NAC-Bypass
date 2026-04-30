@@ -33,20 +33,21 @@ EOF
   exit 0
 }
 
-# Parse options
-while getopts ":I:h1:2:acg:rRS" opt; do
+# Parse options. We deliberately do NOT forward -i / -c / -r / -h to the setup
+# script: this wrapper drives those modes itself, and forwarding e.g. -r would
+# cause the setup script to short-circuit into reset-mode and never init/conn.
+while getopts ":I:h1:2:g:RS" opt; do
   case "$opt" in
-    I)  INTERFACE="$OPTARG" ;;
-    h)  Usage ;;
-    *)  # Forward all other options and their arguments
-        COMMON_OPTS+=("-$opt")
-        if [[ "$OPTARG" && "$OPTARG" != -* ]]; then
-          COMMON_OPTS+=("$OPTARG")
-        fi
-        ;;
+    I)         INTERFACE="$OPTARG" ;;
+    h)         Usage ;;
+    1|2|g)     COMMON_OPTS+=("-$opt" "$OPTARG") ;;
+    R|S)       COMMON_OPTS+=("-$opt") ;;
+    \?)        echo "Unknown option: -$OPTARG" >&2; Usage ;;
+    :)         echo "Option -$OPTARG requires an argument" >&2; Usage ;;
   esac
 done
 shift $((OPTIND-1))
+# Any leftover positional args are forwarded as-is
 COMMON_OPTS+=("$@")
 
 echo "[*] Monitoring link on $INTERFACE ; forwarding opts: ${COMMON_OPTS[*]}"
@@ -78,6 +79,9 @@ while true; do
       echo "[!] $INTERFACE is now DOWN"
     fi
   else
+    # Increment first so THRESHOLD_UP=3 actually means 3 × $TIMER
+    # (the previous "increment after check" gave one extra tick).
+    ((STATE_COUNTER++))
     if (( STATE_COUNTER == THRESHOLD_UP && NETWORK_STATE_INTERFACE == 1 )); then
       echo "[!!] Stable UP – running ConnectionSetup"
       call_setup conn
@@ -88,7 +92,6 @@ while true; do
       echo "Resetting settings and re-initialising..."
       call_setup init
     fi
-    ((STATE_COUNTER++))
   fi
 
   STATE_INTERFACE=$NETWORK_STATE_INTERFACE

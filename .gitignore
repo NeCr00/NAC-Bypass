@@ -1,0 +1,5 @@
+# Ignore the following files and directories
+awareness.sh
+nac_bypass_setup.sh
+.claude/
+gitignore

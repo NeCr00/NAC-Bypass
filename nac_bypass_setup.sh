@@ -1,5 +1,7 @@
 #!/bin/bash
 
+VERSION="1.1"
+
 LOG_BASENAME="$(basename "$0" .sh).log"
 LOG_FILE="$(pwd)/${LOG_BASENAME}"       # log file lives where you invoked script
 
@@ -8,6 +10,9 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 # simple coloured logger helper
 log() { printf '\e[1;34m[%s] %s\e[0m\n' "$(date +%T)" "$*"; }
+
+# track whether GWMAC was explicitly provided on the CLI (so Learn() won't clobber it)
+GWMAC_USER_SET=0
 
 
 #===================================================================================================
@@ -68,7 +73,7 @@ RANGE=61000-64000            # high-port SNAT range for outbound TCP/UDP
 
 
 Usage() {                    # Show help and exit
-  echo -e "$0 v$VERSION usage:"
+  echo -e "$0 v${VERSION:-?} usage:"
   echo "    -1 <eth>    network interface plugged into switch"
   echo "    -2 <eth>    network interface plugged into victim machine"
   echo "    -a          autonomous mode"
@@ -90,13 +95,14 @@ CheckParams() {
       "2") COMPINT=$OPTARG ;;                     # override victim-side NIC
       "a") OPTION_AUTONOMOUS=1 ;;                 # silence + timeouts
       "c") OPTION_CONNECTION_SETUP_ONLY=1 ;;      # skip initial br0 build
-      "g") GWMAC=$OPTARG ;;                       # force gateway MAC
+      "g") GWMAC=$OPTARG; GWMAC_USER_SET=1 ;;     # force gateway MAC
       "h") Usage ;;                               # show help
       "i") OPTION_INITIAL_SETUP_ONLY=1 ;;         # only build dark bridge
       "r") OPTION_RESET=1 ;;                      # tear everything down
       "R") OPTION_RESPONDER=1 ;;                  # forward Responder ports
       "S") OPTION_SSH=1 ;;                        # forward SSH + start sshd
-      *)   OPTION_RESPONDER=0; OPTION_SSH=0; OPTION_AUTONOMOUS=0 ;;
+      \?)  echo "Unknown option: -$OPTARG" >&2; Usage ;;
+      :)   echo "Option -$OPTARG requires an argument" >&2; Usage ;;
     esac
   done
 }
@@ -105,53 +111,63 @@ CheckParams() {
 
 Learn(){
 
-    # assume any pcap >24 bytes has at least one packet
-    if [ "$(stat -c %s "$TEMP_FILE_DHCP")" -gt 24 ]; then
-    log "DHCP file has at least one packet"
-    # extract MAC and IP of the victim machine
+    # pcap global header is 24 bytes; anything larger has at least one packet.
+    DHCP_HAS_PKT=0
+    SYN_HAS_PKT=0
+    [ -s "$TEMP_FILE_DHCP" ] && [ "$(stat -c %s "$TEMP_FILE_DHCP")" -gt 24 ] && DHCP_HAS_PKT=1
+    [ -s "$TEMP_FILE_SYN"  ] && [ "$(stat -c %s "$TEMP_FILE_SYN")"  -gt 24 ] && SYN_HAS_PKT=1
 
+    if [ "$DHCP_HAS_PKT" -eq 1 ]; then
+        log "DHCP capture has at least one packet"
     else
-    log "DHCP file is empty"
+        log "DHCP capture is empty"
     fi
 
-    if [ "$(stat -c %s "$TEMP_FILE_SYN")" -gt 24 ]; then
-    log "SYN file has at least one packet"
-    else
-    log "SYN file is empty."
-    log "Cannot learn MAC and IP of the victim machine. Resetting and trying again."
-    ifconfig $SWINT down
-    Reset;
-    exit 1
-    fi
-    
-    # adjust to your filenames
-    DHCP_PCAP="$TEMP_FILE_DHCP"
-    SYN_PCAP="$TEMP_FILE_SYN"
-
-    # 1) choose the non-empty capture (pcap global header is 24 bytes)
-    if [ -s "$DHCP_PCAP" ] && [ "$(stat -c %s "$DHCP_PCAP")" -gt 24 ]; then
-    PCAP="$DHCP_PCAP"
-    FILTER='udp src port 67 and udp dst port 68'
-    else
-    PCAP="$SYN_PCAP"
-    FILTER='tcp[tcpflags] & tcp-syn != 0'
+    if [ "$SYN_HAS_PKT" -eq 1 ]; then
+        log "SYN capture has at least one packet"
+    elif [ "$DHCP_HAS_PKT" -eq 0 ]; then
+        log "Both captures empty - cannot learn MAC/IP of the victim. Resetting and aborting."
+        ifconfig "$SWINT" down 2>/dev/null
+        Reset
+        exit 1
     fi
 
-    # 2) read the first packet line
-    line=$(sudo tcpdump -nn -e -r "$PCAP" -c1 $FILTER)
+    # Pick the richer source: prefer DHCP (carries explicit client IP/MAC), fall back to SYN.
+    if [ "$DHCP_HAS_PKT" -eq 1 ]; then
+        PCAP="$TEMP_FILE_DHCP"
+        FILTER='udp src port 67 and udp dst port 68'
+    else
+        PCAP="$TEMP_FILE_SYN"
+        FILTER='tcp[tcpflags] & tcp-syn != 0'
+    fi
 
-    # 3) parse out fields
-    GWMAC=$(awk '{print $2}' <<<"$line")
+    line=$(tcpdump -nn -e -r "$PCAP" -c1 $FILTER 2>/dev/null)
+
+    # Field positions from `tcpdump -nn -e` for a non-VLAN frame:
+    #   $2 = src MAC, $4 = dst MAC (with trailing comma), $10 = src ip.port, $12 = dst ip.port
+    LEARNED_GWMAC=$(awk '{print $2}' <<<"$line")
     COMPMAC=$(awk '{gsub(/,$/,"",$4); print $4}' <<<"$line")
-    GWIP=$(awk '{print $10}' <<<"$line" | cut -d. -f1-4)
-    COMIP=$(awk '{print $12}' <<<"$line" | cut -d. -f1-4)
+    GWIP=$(awk '{print $10}'  <<<"$line" | awk -F. '{print $1"."$2"."$3"."$4}')
+    COMIP=$(awk '{print $12}' <<<"$line" | awk -F. '{print $1"."$2"."$3"."$4}')
 
-    # 4) output
-    echo "Switch MAC : $GWMAC"
-    echo "Switch IP  : $GWIP"
-    echo "Victim  MAC : $COMPMAC"
-    echo "Victim  IP  : $COMIP"
-}    
+    # Respect user-supplied -g GWMAC; otherwise use what we sniffed.
+    if [ "$GWMAC_USER_SET" -eq 1 ] && [ -n "$GWMAC" ]; then
+        log "Keeping user-supplied GWMAC=$GWMAC (sniffed: $LEARNED_GWMAC)"
+    else
+        GWMAC="$LEARNED_GWMAC"
+    fi
+
+    # If DHCP reply was broadcast, $4 == ff:ff:ff:ff:ff:ff -> not the victim.
+    # Warn so the operator can rerun (or pass -g) instead of silently misconfiguring.
+    if [ "$COMPMAC" = "ff:ff:ff:ff:ff:ff" ] || [ -z "$COMPMAC" ]; then
+        log "WARNING: learned victim MAC looks invalid ('$COMPMAC'). DHCP reply may have been broadcast - consider re-running once a unicast frame is seen."
+    fi
+
+    echo "Switch MAC  : $GWMAC"
+    echo "Switch IP   : $GWIP"
+    echo "Victim MAC  : $COMPMAC"
+    echo "Victim IP   : $COMIP"
+}
 #===================================================================================================
 
 InitialSetup() {
@@ -159,8 +175,18 @@ InitialSetup() {
     log "Starting Initial Setup..."
 
     # ──── Kill noisy services and harden host networking ────
-    systemctl stop NetworkManager.service                      # avoid auto-DHCP
-    cp /etc/sysctl.conf /etc/sysctl.conf.bak                   # backup
+    systemctl stop NetworkManager.service 2>/dev/null          # avoid auto-DHCP
+
+    # Backup sysctl.conf only if no backup exists - prevents clobbering the
+    # original on a second run (which would otherwise be permanently lost).
+    if [ ! -f /etc/sysctl.conf.bak ]; then
+        cp /etc/sysctl.conf /etc/sysctl.conf.bak
+    fi
+
+    # Backup resolv.conf for the same reason before we wipe it.
+    if [ ! -f /etc/resolv.conf.bak ] && [ -f /etc/resolv.conf ]; then
+        cp /etc/resolv.conf /etc/resolv.conf.bak
+    fi
 
     # Load br_netfilter so iptables conntrack can process bridged return traffic
     modprobe br_netfilter
@@ -170,21 +196,24 @@ net.ipv6.conf.all.disable_ipv6 = 1
 net.bridge.bridge-nf-call-iptables = 1
 EOF
     sysctl -p                                                  # reload
-    echo "" > /etc/resolv.conf
+    : > /etc/resolv.conf                                       # blank DNS (backup taken above)
 
     # Disable multicast on both NICs → no IGMP join chatter
     ip link set $SWINT multicast off
     ip link set $COMPINT multicast off
 
-    # Stop time-sync daemons (can broadcast NTP packets)
+    # Stop time-sync daemons (can broadcast NTP packets). Record what we
+    # stopped so Reset() can restart only those, not every NTP daemon installed.
+    : > /tmp/nac_bypass_ntp_stopped
     declare -a NTP_SERVICES=("ntp.service" "ntpsec.service" "chronyd.service" "systemd-timesyncd.service")
     for NTP_SERVICE in "${NTP_SERVICES[@]}"; do
-        NTP_SERVICE_STATUS=$(systemctl is-active $NTP_SERVICE)
-        if [ $NTP_SERVICE_STATUS == "active" ]; then
-            systemctl stop $NTP_SERVICE
+        NTP_SERVICE_STATUS=$(systemctl is-active "$NTP_SERVICE" 2>/dev/null)
+        if [ "$NTP_SERVICE_STATUS" = "active" ]; then
+            systemctl stop "$NTP_SERVICE"
+            echo "$NTP_SERVICE" >> /tmp/nac_bypass_ntp_stopped
         fi
     done
-    timedatectl set-ntp false                                  # make sure it stays off
+    timedatectl set-ntp false 2>/dev/null                      # make sure it stays off
     
     log "Stopping noisy services (NetworkManager, NTP, IPv6)"
 
@@ -330,30 +359,73 @@ ConnectionSetup() {
 }
 #===================================================================================================
 
-#4. Reset – remove bridge and flush rules
+#4. Reset – remove bridge and flush rules. Must be idempotent: awareness.sh
+#   calls reset before any setup has run, so every cleanup step has to tolerate
+#   the absence of the resource it's tearing down.
 Reset() {
 
-    # Bring bridge down and delete it
-    ifconfig $BRINT down
-    brctl delbr $BRINT
+    # Bring bridge down and delete it (only if present)
+    if [ -d "/sys/class/net/$BRINT" ]; then
+        ifconfig "$BRINT" down 2>/dev/null
+        brctl delbr "$BRINT" 2>/dev/null
+    fi
 
-    # Remove default route and static ARP
-    arp -d -i $BRINT $BRGW $GWMAC
-    route del default dev $BRINT
+    # Remove static ARP entry (arp -d takes only the host; iface is selected via -i)
+    arp -d -i "$BRINT" "$BRGW" 2>/dev/null
 
-    # Flush all packet-filter tables
-    $CMD_EBTABLES -F
-    $CMD_EBTABLES -F -t nat
-    $CMD_ARPTABLES -F OUTPUT
-    $CMD_IPTABLES  -F
-    $CMD_IPTABLES  -F -t nat
+    # Remove the default route we added (only if it points at $BRINT)
+    if ip route show default 2>/dev/null | grep -q "dev $BRINT"; then
+        route del default dev "$BRINT" 2>/dev/null
+    fi
 
-    # Restore original sysctl.conf
-    cp /etc/sysctl.conf.bak /etc/sysctl.conf
-    rm /etc/sysctl.conf.bak
-    sysctl -p
+    # Targeted removal of the OUTPUT DROP rules we added in InitialSetup. Using
+    # `iptables -F` would nuke the operator's unrelated firewall rules, so we
+    # delete only what we know we installed and ignore "rule not found" errors.
+    $CMD_ARPTABLES -D OUTPUT -o "$SWINT"  -j DROP 2>/dev/null
+    $CMD_ARPTABLES -D OUTPUT -o "$COMPINT" -j DROP 2>/dev/null
+    $CMD_IPTABLES  -D OUTPUT -o "$COMPINT" -j DROP 2>/dev/null
+    $CMD_IPTABLES  -D OUTPUT -o "$SWINT"  -j DROP 2>/dev/null
 
-    log "Bridge $BRINT deleted, all rules flushed, sysctl restored !"
+    # Flush ebtables (we own all entries here) and the iptables NAT table
+    # (the script populates PREROUTING/POSTROUTING extensively and the operator
+    # is not expected to share NAT rules with this host while bridging).
+    $CMD_EBTABLES  -F            2>/dev/null
+    $CMD_EBTABLES  -F -t nat     2>/dev/null
+    $CMD_IPTABLES  -F -t nat     2>/dev/null
+
+    # Re-enable multicast on the physical NICs
+    [ -d "/sys/class/net/$SWINT"  ] && ip link set "$SWINT"  multicast on 2>/dev/null
+    [ -d "/sys/class/net/$COMPINT" ] && ip link set "$COMPINT" multicast on 2>/dev/null
+
+    # Restore sysctl.conf (only if a backup exists)
+    if [ -f /etc/sysctl.conf.bak ]; then
+        cp /etc/sysctl.conf.bak /etc/sysctl.conf
+        rm -f /etc/sysctl.conf.bak
+        sysctl -p >/dev/null 2>&1
+    fi
+
+    # Restore resolv.conf if we backed one up
+    if [ -f /etc/resolv.conf.bak ]; then
+        cp /etc/resolv.conf.bak /etc/resolv.conf
+        rm -f /etc/resolv.conf.bak
+    fi
+
+    # Restart only the NTP services we stopped (recorded in InitialSetup)
+    if [ -f /tmp/nac_bypass_ntp_stopped ]; then
+        while IFS= read -r svc; do
+            [ -n "$svc" ] && systemctl start "$svc" 2>/dev/null
+        done < /tmp/nac_bypass_ntp_stopped
+        rm -f /tmp/nac_bypass_ntp_stopped
+    fi
+    timedatectl set-ntp true 2>/dev/null
+
+    # Bring NetworkManager back up so the host regains normal connectivity
+    systemctl start NetworkManager.service 2>/dev/null
+
+    # Clean any leftover capture files
+    rm -f "$TEMP_FILE_DHCP" "$TEMP_FILE_SYN"
+
+    log "Bridge $BRINT torn down, our rules removed, host state restored."
 }
 #===================================================================================================
 

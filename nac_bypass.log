@@ -1,0 +1,88 @@
+./nac_bypass.sh v2.0
+
+Unified NAC bypass: builds a transparent L2 bridge, learns the victim's
+MAC/IP, installs SNAT/DNAT so the host's own traffic egresses as the victim,
+and continuously monitors the link.
+
+Usage: ./nac_bypass.sh [options] [-E -- <command...>]
+
+Bridge / interfaces:
+  -1 <iface>   NIC plugged into the switch          (default: eth0)
+  -2 <iface>   NIC plugged into the victim          (default: eth1)
+  -I <iface>   NIC to monitor for link state        (default: same as -2)
+  -g <MAC>     Manually set gateway/switch MAC
+
+Egress configuration (so tools on this host can reach the network):
+  -d <ip>      Primary DNS to write into resolv.conf (default: 8.8.8.8)
+  -m <num>     Metric for the br0 default route     (default: 0, 0=preferred)
+
+Service redirection:
+  -R           Enable Responder port redirection
+  -S           Enable SSH redirection and start sshd
+
+Modes:
+  -E           After setup, exec the trailing command (e.g. -E -- nmap -sT 10.0.0.0/24)
+               and exit. Wraps known tools (nmap/ping/curl/wget/ssh) with the
+               correct interface and source-IP flags so the SNAT rule actually
+               matches.
+  -N           Don't enter the monitor loop after setup (one-shot setup).
+  -M           Skip initial setup, jump straight to monitor loop.
+  -i           Initial setup only and exit.
+  -c           Connection setup only and exit.
+  -r           Reset all state and exit.
+  -a           Autonomous mode (silence prompts).
+  -h           Show this help.
+
+Examples:
+  ./nac_bypass.sh -R -S                       # full pipeline + monitor loop, with Responder & SSH
+  ./nac_bypass.sh -E -- nmap -sT 10.0.0.0/24  # bring bridge up, run nmap as victim, tear down
+  ./nac_bypass.sh -E -- bash                  # interactive shell sourcing as victim
+  ./nac_bypass.sh -r                          # tear everything down
+
+Default (no -r/-i/-c/-E): runs initial setup, the first connection setup,
+then monitors the link forever. Ctrl-C cleanly tears everything down.
+[1;31m[16:51:08] -E requires a trailing command (e.g. -E -- nmap -sT 10.0.0.0/24)[0m
+Unknown option: -X
+./nac_bypass.sh v2.0
+
+Unified NAC bypass: builds a transparent L2 bridge, learns the victim's
+MAC/IP, installs SNAT/DNAT so the host's own traffic egresses as the victim,
+and continuously monitors the link.
+
+Usage: ./nac_bypass.sh [options] [-E -- <command...>]
+
+Bridge / interfaces:
+  -1 <iface>   NIC plugged into the switch          (default: eth0)
+  -2 <iface>   NIC plugged into the victim          (default: eth1)
+  -I <iface>   NIC to monitor for link state        (default: same as -2)
+  -g <MAC>     Manually set gateway/switch MAC
+
+Egress configuration (so tools on this host can reach the network):
+  -d <ip>      Primary DNS to write into resolv.conf (default: 8.8.8.8)
+  -m <num>     Metric for the br0 default route     (default: 0, 0=preferred)
+
+Service redirection:
+  -R           Enable Responder port redirection
+  -S           Enable SSH redirection and start sshd
+
+Modes:
+  -E           After setup, exec the trailing command (e.g. -E -- nmap -sT 10.0.0.0/24)
+               and exit. Wraps known tools (nmap/ping/curl/wget/ssh) with the
+               correct interface and source-IP flags so the SNAT rule actually
+               matches.
+  -N           Don't enter the monitor loop after setup (one-shot setup).
+  -M           Skip initial setup, jump straight to monitor loop.
+  -i           Initial setup only and exit.
+  -c           Connection setup only and exit.
+  -r           Reset all state and exit.
+  -a           Autonomous mode (silence prompts).
+  -h           Show this help.
+
+Examples:
+  ./nac_bypass.sh -R -S                       # full pipeline + monitor loop, with Responder & SSH
+  ./nac_bypass.sh -E -- nmap -sT 10.0.0.0/24  # bring bridge up, run nmap as victim, tear down
+  ./nac_bypass.sh -E -- bash                  # interactive shell sourcing as victim
+  ./nac_bypass.sh -r                          # tear everything down
+
+Default (no -r/-i/-c/-E): runs initial setup, the first connection setup,
+then monitors the link forever. Ctrl-C cleanly tears everything down.
