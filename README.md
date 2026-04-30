@@ -2,7 +2,7 @@
 
 # NAC Bypass
 
-### Transparent-bridge Network Access Control bypass utility for authorized internal penetration testing
+### Transparent-bridge Network Access Control Bypass
 
 <br>
 
@@ -45,33 +45,6 @@ Tools running on the attacking host (`nmap`, `NetExec`, `Impacket`, `smbclient`,
 `responder`, `evil-winrm`, …) reach internal hosts as the workstation; replies
 are reverse-NAT'd by conntrack and delivered to the local stack instead of being
 forwarded on to the workstation.
-
-> **Authorized engagements only.** This tool is intended for sanctioned internal
-> penetration tests. Confirm scope and written authorization before running it
-> against any infrastructure you do not own.
-
----
-
-## Features
-
-- **Transparent L2 bridge** with EAPOL forwarded, STP off, zero forward delay.
-- **Passive learning** of victim/gateway MAC + IP via parallel ARP / DHCP / SYN
-  capture. No active probes.
-- **L2 + L3 masquerade** — `ebtables` rewrites src MAC; `iptables` SNATs src IP
-  into a high-port range with `--random-fully` for collision avoidance.
-- **Return traffic via conntrack** — operator's tools receive replies; the
-  workstation never sees them.
-- **Service redirection** — optional Responder DNAT (`-R`) and sshd DNAT (`-S`).
-- **Continuous link monitor** — auto re-arm on cable replug, auto tear-down on
-  stable disconnect.
-- **State-tracked cleanup** — every change leaves a marker in `/run/nac_bypass`,
-  so cleanup reverses *only* what the script touched. No flushed firewalls, no
-  destroyed default routes, no broken NM state.
-- **Cleanup guaranteed** — Ctrl+C, SIGTERM, SIGHUP, SIGQUIT, error exit, normal
-  exit — all paths run `full_reset` exactly once before terminating.
-- **Production-grade preflight** — root, kernel modules (`br_netfilter`,
-  `nf_conntrack`), required binaries, interface availability, NM conflicts,
-  promiscuous-mode capability — all validated before any change is made.
 
 ---
 
@@ -216,35 +189,6 @@ firewall, container, or VPN rules untouched.
 
 ---
 
-## Cleanup contract
-
-The script **always** cleans up before exiting. Trapped signals:
-
-| Signal | Exit code |
-|--------|-----------|
-| `SIGINT` (Ctrl+C) | `130` |
-| `SIGTERM` | `143` |
-| `SIGHUP` | `129` |
-| `SIGQUIT` | `131` |
-| Error (`set -u`, `die`, etc.) | `1` |
-| Normal completion | `0` |
-
-In all cases, the EXIT trap calls `full_reset`, which:
-
-- Removes the bridge and detaches members.
-- Brings physical NICs back UP, multicast on, promiscuous off.
-- Deletes the private nat chains.
-- Restores sysctls, `resolv.conf`, default routes.
-- Restarts services it stopped, stops services it started.
-- Hands NICs back to NetworkManager.
-- Persists the run log to `/tmp/nac_bypass-<ts>.log`.
-
-If the script was killed via `SIGKILL` or a power loss, run
-`sudo ./nac_bypass.sh -r` from any shell to recover from the persisted state
-directory.
-
----
-
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
@@ -255,20 +199,6 @@ directory.
 | Tools work but get no replies | `bridge-nf-call-iptables=0` or `nf_conntrack` not loaded | Both are mandatory; preflight enforces them |
 | Replies go to wrong NIC | Operator has a lower-metric default route | Use `-m 0` (default) and/or pin tools with `-e nacbr0 -S 169.254.66.66` |
 | Workstation drops auth briefly | Hundreds-of-ms gap during bridge enslavement | Acceptable; most NACs tolerate it |
-
----
-
-## Project layout
-
-```text
-nac-bypass/
-├── nac_bypass.sh           Main script (production)
-├── nac_bypass_setup.sh     Legacy single-shot setup script (reference)
-├── awareness.sh            Legacy link-state monitor (reference)
-└── README.md
-```
-
-Only `nac_bypass.sh` is needed. The two legacy scripts are kept for reference.
 
 ---
 
