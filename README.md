@@ -18,20 +18,12 @@
 
 <br>
 
-```text
-                                                                
-   [ Workstation ] ─── eth1 ─┬─ [ nacbr0 ] ─┬─ eth0 ─── [ Switch ]
-                             │              │
-                             └──── Attacker host ────┘
-                                  (you are here)
-                                                                
-```
+<img width="1024" height="559" alt="83139aef-6216-4873-bac2-f4ee23a92eba" src="https://github.com/user-attachments/assets/dc84b336-59e5-4b1c-baad-2ced186cfd15" />
+
 
 <sub><i>One Linux box. Two NICs. Inherit the workstation's NAC session.</i></sub>
 
 </div>
-
----
 
 ## Overview
 
@@ -45,8 +37,6 @@ Tools running on the attacking host (`nmap`, `NetExec`, `Impacket`, `smbclient`,
 `responder`, `evil-winrm`, …) reach internal hosts as the workstation; replies
 are reverse-NAT'd by conntrack and delivered to the local stack instead of being
 forwarded on to the workstation.
-
----
 
 ## Architecture
 
@@ -77,7 +67,7 @@ The host's own packets get SNAT'd at L2 and L3 so they appear on the wire as
 the workstation; their replies are reverse-NAT'd back to the host's stack
 instead of being bridged on to the workstation.
 
----
+
 
 ## Requirements
 
@@ -97,7 +87,7 @@ Optional: `nmcli` (NM unmanage), `arptables`, `Responder`, `openssh-server`.
 sudo apt-get install iproute2 tcpdump macchanger ebtables iptables
 ```
 
----
+
 
 ## Installation
 
@@ -109,7 +99,7 @@ chmod +x nac_bypass.sh
 
 No build step. Single self-contained Bash script.
 
----
+
 
 ## Usage
 
@@ -169,7 +159,6 @@ impacket-secretsdump alice@10.0.0.5
 responder -I nacbr0      # if -R was supplied
 ```
 
----
 
 ## How it works
 
@@ -187,7 +176,7 @@ All bypass NAT rules live in dedicated `NACBYPASS_OUT` / `NACBYPASS_IN` /
 `NACBYPASS` chains — cleanup deletes only those, leaving any operator-installed
 firewall, container, or VPN rules untouched.
 
----
+
 
 ## Troubleshooting
 
@@ -200,7 +189,7 @@ firewall, container, or VPN rules untouched.
 | Replies go to wrong NIC | Operator has a lower-metric default route | Use `-m 0` (default) and/or pin tools with `-e nacbr0 -S 169.254.66.66` |
 | Workstation drops auth briefly | Hundreds-of-ms gap during bridge enslavement | Acceptable; most NACs tolerate it |
 
----
+
 
 ## Disclaimer
 
@@ -211,5 +200,4 @@ liability and are not responsible for any misuse or damage caused by this
 program. Unauthorized use against systems you do not own may violate local,
 state, or federal law.
 
----
 
