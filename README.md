@@ -12,10 +12,6 @@
 [![License](https://img.shields.io/badge/license-MIT-green.svg?style=for-the-badge)](#license)
 [![Status](https://img.shields.io/badge/status-production-brightgreen.svg?style=for-the-badge)](#)
 
-[![Stars](https://img.shields.io/github/stars/yourname/nac-bypass?style=social)](#)
-[![Forks](https://img.shields.io/github/forks/yourname/nac-bypass?style=social)](#)
-[![Issues](https://img.shields.io/github/issues/yourname/nac-bypass?style=social)](#)
-
 <br>
 
 <img width="1024" height="559" alt="83139aef-6216-4873-bac2-f4ee23a92eba" src="https://github.com/user-attachments/assets/dc84b336-59e5-4b1c-baad-2ced186cfd15" />
