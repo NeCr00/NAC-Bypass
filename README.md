@@ -2,7 +2,7 @@
 
 # NAC Bypass
 
-### Transparent-bridge Network Access Control Bypass
+### Transparent-Bridge Network Access Control Bypass
 
 <br>
 
@@ -23,7 +23,7 @@
 
 ## Overview
 
-`nac_bypass.sh` turns a Linux laptop with two Ethernet NICs into a **transparent
+`nac_bypass.sh` turns a Linux host with two Ethernet NICs into a **transparent
 Layer-2 bridge** between an authorized workstation and its switch port. The
 workstation's 802.1X / MAC-auth session stays alive through the bridge, while
 the attacking host masquerades its own outbound traffic as the workstation —
