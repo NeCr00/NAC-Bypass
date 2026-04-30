@@ -14,54 +14,18 @@
 
 <br>
 
-<img width="1024" height="559" alt="83139aef-6216-4873-bac2-f4ee23a92eba" src="https://github.com/user-attachments/assets/dc84b336-59e5-4b1c-baad-2ced186cfd15" />
-
-
 <sub><i>One Linux box. Two NICs. Inherit the workstation's NAC session.</i></sub>
 
 </div>
 
 ## Overview
 
-`nac_bypass.sh` turns a Linux host with two Ethernet NICs into a **transparent
-Layer-2 bridge** between an authorized workstation and its switch port. The
-workstation's 802.1X / MAC-auth session stays alive through the bridge, while
-the attacking host masquerades its own outbound traffic as the workstation —
-egressing the wire with the workstation's MAC and IP.
-
-Tools running on the attacking host (`nmap`, `NetExec`, `Impacket`, `smbclient`,
-`responder`, `evil-winrm`, …) reach internal hosts as the workstation; replies
-are reverse-NAT'd by conntrack and delivered to the local stack instead of being
-forwarded on to the workstation.
+`nac_bypass.sh` transforms a Linux system with two Ethernet interfaces into a transparent Layer-2 bridge positioned between a legitimate workstation and the network switch. The bridge transparently forwards traffic while preserving the workstation’s active 802.1X or MAC-based authentication session, allowing the connection to remain authorized by the NAC infrastructure.
 
 ## Architecture
 
-```text
+<img width="1536" height="1024" alt="ee47985b-5e6f-4ceb-8141-278d55626ee5" src="https://github.com/user-attachments/assets/2449f4d1-8338-4830-997c-fca9cc8b3a46" />
 
-   ┌──────────────┐     ┌─────────────────────────────────┐     ┌────────────┐
-   │              │     │   Attacker host (this machine)  │     │            │
-   │              │     │                                 │     │            │
-   │   Switch     │◄───►│  eth0 ─┐                ┌─ eth1 │◄───►│ Workstation│
-   │  (802.1X /   │     │        │   nacbr0       │       │     │            │
-   │   MAC-auth)  │     │        ├──[ bridge ]────┤       │     │            │
-   │              │     │        │   STP off      │       │     │            │
-   └──────────────┘     │        │   EAPOL fwd    │       │     └────────────┘
-                        │        │                │       │
-                        │      [ebtables nat]     │       │
-                        │      [iptables nat]     │       │
-                        │      [conntrack]        │       │
-                        │                                 │
-                        │  Local stack ──► br0 ──► SNAT ──┼──► out as workstation
-                        │  Local stack ◄── DNAT ◄── br0 ◄─┼──── replies (conntrack)
-                        │                                 │
-                        └─────────────────────────────────┘
-
-```
-
-The workstation's frames pass through unchanged (preserving its NAC session).
-The host's own packets get SNAT'd at L2 and L3 so they appear on the wire as
-the workstation; their replies are reverse-NAT'd back to the host's stack
-instead of being bridged on to the workstation.
 
 
 
