@@ -2,7 +2,7 @@
 
 # NAC Bypass
 
-### Transparent-bridge Network Access Control Bypass
+### Transparent-Bridge Network Access Control Bypass
 
 <br>
 
@@ -12,72 +12,22 @@
 [![License](https://img.shields.io/badge/license-MIT-green.svg?style=for-the-badge)](#license)
 [![Status](https://img.shields.io/badge/status-production-brightgreen.svg?style=for-the-badge)](#)
 
-[![Stars](https://img.shields.io/github/stars/yourname/nac-bypass?style=social)](#)
-[![Forks](https://img.shields.io/github/forks/yourname/nac-bypass?style=social)](#)
-[![Issues](https://img.shields.io/github/issues/yourname/nac-bypass?style=social)](#)
-
 <br>
-
-```text
-                                                                
-   [ Workstation ] ─── eth1 ─┬─ [ nacbr0 ] ─┬─ eth0 ─── [ Switch ]
-                             │              │
-                             └──── Attacker host ────┘
-                                  (you are here)
-                                                                
-```
 
 <sub><i>One Linux box. Two NICs. Inherit the workstation's NAC session.</i></sub>
 
 </div>
 
----
-
 ## Overview
 
-`nac_bypass.sh` turns a Linux laptop with two Ethernet NICs into a **transparent
-Layer-2 bridge** between an authorized workstation and its switch port. The
-workstation's 802.1X / MAC-auth session stays alive through the bridge, while
-the attacking host masquerades its own outbound traffic as the workstation —
-egressing the wire with the workstation's MAC and IP.
-
-Tools running on the attacking host (`nmap`, `NetExec`, `Impacket`, `smbclient`,
-`responder`, `evil-winrm`, …) reach internal hosts as the workstation; replies
-are reverse-NAT'd by conntrack and delivered to the local stack instead of being
-forwarded on to the workstation.
-
----
+`nac_bypass.sh` transforms a Linux system with two Ethernet interfaces into a transparent Layer-2 bridge positioned between a legitimate workstation and the network switch. The bridge transparently forwards traffic while preserving the workstation’s active 802.1X or MAC-based authentication session, allowing the connection to remain authorized by the NAC infrastructure.
 
 ## Architecture
 
-```text
+<img width="1536" height="1024" alt="ee47985b-5e6f-4ceb-8141-278d55626ee5" src="https://github.com/user-attachments/assets/2449f4d1-8338-4830-997c-fca9cc8b3a46" />
 
-   ┌──────────────┐     ┌─────────────────────────────────┐     ┌────────────┐
-   │              │     │   Attacker host (this machine)  │     │            │
-   │              │     │                                 │     │            │
-   │   Switch     │◄───►│  eth0 ─┐                ┌─ eth1 │◄───►│ Workstation│
-   │  (802.1X /   │     │        │   nacbr0       │       │     │            │
-   │   MAC-auth)  │     │        ├──[ bridge ]────┤       │     │            │
-   │              │     │        │   STP off      │       │     │            │
-   └──────────────┘     │        │   EAPOL fwd    │       │     └────────────┘
-                        │        │                │       │
-                        │      [ebtables nat]     │       │
-                        │      [iptables nat]     │       │
-                        │      [conntrack]        │       │
-                        │                                 │
-                        │  Local stack ──► br0 ──► SNAT ──┼──► out as workstation
-                        │  Local stack ◄── DNAT ◄── br0 ◄─┼──── replies (conntrack)
-                        │                                 │
-                        └─────────────────────────────────┘
 
-```
 
-The workstation's frames pass through unchanged (preserving its NAC session).
-The host's own packets get SNAT'd at L2 and L3 so they appear on the wire as
-the workstation; their replies are reverse-NAT'd back to the host's stack
-instead of being bridged on to the workstation.
-
----
 
 ## Requirements
 
@@ -97,7 +47,7 @@ Optional: `nmcli` (NM unmanage), `arptables`, `Responder`, `openssh-server`.
 sudo apt-get install iproute2 tcpdump macchanger ebtables iptables
 ```
 
----
+
 
 ## Installation
 
@@ -109,7 +59,7 @@ chmod +x nac_bypass.sh
 
 No build step. Single self-contained Bash script.
 
----
+
 
 ## Usage
 
@@ -169,7 +119,6 @@ impacket-secretsdump alice@10.0.0.5
 responder -I nacbr0      # if -R was supplied
 ```
 
----
 
 ## How it works
 
@@ -187,7 +136,7 @@ All bypass NAT rules live in dedicated `NACBYPASS_OUT` / `NACBYPASS_IN` /
 `NACBYPASS` chains — cleanup deletes only those, leaving any operator-installed
 firewall, container, or VPN rules untouched.
 
----
+
 
 ## Troubleshooting
 
@@ -200,7 +149,7 @@ firewall, container, or VPN rules untouched.
 | Replies go to wrong NIC | Operator has a lower-metric default route | Use `-m 0` (default) and/or pin tools with `-e nacbr0 -S 169.254.66.66` |
 | Workstation drops auth briefly | Hundreds-of-ms gap during bridge enslavement | Acceptable; most NACs tolerate it |
 
----
+
 
 ## Disclaimer
 
@@ -211,5 +160,4 @@ liability and are not responsible for any misuse or damage caused by this
 program. Unauthorized use against systems you do not own may violate local,
 state, or federal law.
 
----
 
